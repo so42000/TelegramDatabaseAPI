@@ -104,15 +104,20 @@ describe("tg storage app", () => {
   test("round trip: PUT then GET returns the same bytes; Telegram only sees ciphertext", async () => {
     const app = await launch(makeConfig());
     const token = await createBucketViaBot("myapp");
-    const put = await putObject(app, "myapp", "notes/alice.txt", token, "hello Alice", "text/plain");
+    const body = JSON.stringify({ name: "Alice" });
+    const put = await putObject(app, "myapp", "users/1", token, body, "application/json");
     expect(put.status).toBe(201);
+    const meta = (await put.json()) as { key: string; etag: string };
+    expect(meta.key).toBe("users/1");
+    expect(meta.etag).toBe(new Bun.CryptoHasher("sha256").update(body).digest("hex"));
 
-    const get = await fetch(objectUrl(app, "myapp", "notes/alice.txt"), {
+    const get = await fetch(objectUrl(app, "myapp", "users/1"), {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(get.status).toBe(200);
-    expect(get.headers.get("content-type")).toBe("text/plain");
-    expect(await get.text()).toBe("hello Alice");
+    expect(get.headers.get("content-type")).toBe("application/json");
+    expect(get.headers.get("etag")).toBe(`"${meta.etag}"`);
+    expect(await get.text()).toBe(body);
 
     const blobs = [...fake.state.files.values()];
     expect(blobs.length).toBeGreaterThan(0);

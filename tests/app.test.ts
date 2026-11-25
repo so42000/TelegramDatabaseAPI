@@ -1,0 +1,248 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createApp, type App } from "../src/app";
+import type { Config } from "../src/config";
+import { MAX_OBJECT_BYTES } from "../src/store";
+import { FAKE_CHANNEL_ID, startFakeTelegram, type FakeTelegram } from "./fake-telegram";
+
+const TOKEN_RE = /tgs_[A-Za-z0-9_-]{43}/;
+const OWNER_ID = 42;
+
+let fake: FakeTelegram;
+let dirs: string[] = [];
+let running: App[] = [];
+
+beforeEach(() => {
+  fake = startFakeTelegram();
+});
+
+afterEach(async () => {
+  for (const app of running.splice(0)) await app.stop();
+  fake.stop();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function makeConfig(over: Partial<Config> = {}): Config {
+  const dir = mkdtempSync(join(tmpdir(), "tgstore-"));
+  dirs.push(dir);
+  return {
+    botToken: "123456:test-token",
+    channelId: FAKE_CHANNEL_ID,
+    ownerIds: new Set([OWNER_ID]),
+    masterKey: crypto.getRandomValues(new Uint8Array(32)),
+    port: 0,
+    dbPath: join(dir, "index.sqlite"),
+    apiBase: fake.apiBase,
+    snapshotIntervalMs: 3_600_000,
+    channelMinIntervalMs: 0,
+    queueMax: 20,
+    botPolling: true,
+    ...over,
+  };
+}
+
+// Starts an app whose stop() is idempotent, so afterEach can stop it even after a test already did.
+async function launch(config: Config): Promise<App> {
+  const app = await createApp(config);
+  let stopped = false;
+  const handle: App = {
+    port: app.port,
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      await app.stop();
+    },
+  };
+  running.push(handle);
+  return handle;
+}
+
+function ownerMessage(extra: Record<string, unknown>, chatId = OWNER_ID, userId = OWNER_ID): Record<string, unknown> {
+  return {
+    chat: { id: chatId, type: "private" },
+    from: { id: userId, is_bot: false, first_name: "owner" },
+    ...extra,
+  };
+}
+
+// Sends /newbucket through the bot and returns the password from the reply.
+async function createBucketViaBot(name: string): Promise<string> {
+  const before = fake.state.sent.length;
+  await fake.state.sendUpdate(ownerMessage({ text: `/newbucket ${name}` }));
+  const token = fake.state.sent
+    .slice(before)
+    .map((s) => s.text)
+    .join("\n")
+    .match(TOKEN_RE)?.[0];
+  if (token === undefined) throw new Error("bot reply has no bucket password");
+  return token;
+}
+
+function objectUrl(app: App, bucket: string, key: string): string {
+  return `http://localhost:${app.port}/v1/buckets/${bucket}/objects/${encodeURI(key)}`;
+}
+
+function authHeaders(token: string, contentType = "application/octet-stream"): Record<string, string> {
+  return { Authorization: `Bearer ${token}`, "Content-Type": contentType };
+}
+
+function putObject(app: App, bucket: string, key: string, token: string, body: BodyInit, contentType?: string) {
+  return fetch(objectUrl(app, bucket, key), {
+    method: "PUT",
+    headers: authHeaders(token, contentType),
+    body,
+  });
+}
+
+function sendDocumentCount(): number {
+  return fake.state.calls.filter((c) => c === "sendDocument").length;
+}
+
+describe("tg storage app", () => {
+  test("round trip: PUT then GET returns the same bytes; Telegram only sees ciphertext", async () => {
+    const app = await launch(makeConfig());
+    const token = await createBucketViaBot("myapp");
+    const put = await putObject(app, "myapp", "notes/alice.txt", token, "hello Alice", "text/plain");
+    expect(put.status).toBe(201);
+
+    const get = await fetch(objectUrl(app, "myapp", "notes/alice.txt"), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(get.status).toBe(200);
+    expect(get.headers.get("content-type")).toBe("text/plain");
+    expect(await get.text()).toBe("hello Alice");
+
+    const blobs = [...fake.state.files.values()];
+    expect(blobs.length).toBeGreaterThan(0);
+    for (const blob of blobs) expect(Buffer.from(blob).includes("Alice")).toBe(false);
+  });
+
+  test("wrong password and another bucket's password are both rejected with 401", async () => {
+    const app = await launch(makeConfig());
+    const myappToken = await createBucketViaBot("myapp");
+    const otherToken = await createBucketViaBot("other");
+    expect(myappToken).not.toBe(otherToken);
+
+    const wrong = await putObject(app, "myapp", "k", "tgs_" + "A".repeat(43), "x");
+    expect(wrong.status).toBe(401);
+
+    const cross = await putObject(app, "myapp", "k", otherToken, "x");
+    expect(cross.status).toBe(401);
+  });
+
+  test("a non-owner /newbucket is ignored: no reply and no bucket", async () => {
+    const app = await launch(makeConfig());
+    await fake.state.sendUpdate(ownerMessage({ text: "/newbucket hacker" }, 7, 7));
+    expect(fake.state.sent).toHaveLength(0);
+
+    const res = await fetch(objectUrl(app, "hacker", "k"), { method: "PUT", body: "x" });
+    expect(res.status).toBe(401);
+  });
+
+  test("overwrite returns 201 then 200 and the replaced message is deleted on flush", async () => {
+    const app = await launch(makeConfig());
+    const token = await createBucketViaBot("myapp");
+
+    expect((await putObject(app, "myapp", "k", token, "v1")).status).toBe(201);
+    const v1Id = [...fake.state.messages.keys()].at(-1);
+    expect(v1Id).toBeDefined();
+
+    expect((await putObject(app, "myapp", "k", token, "v2")).status).toBe(200);
+    const get = await fetch(objectUrl(app, "myapp", "k"), { headers: { Authorization: `Bearer ${token}` } });
+    expect(await get.text()).toBe("v2");
+
+    await app.stop();
+    expect(fake.state.deleted).toContain(v1Id as number);
+  });
+
+  test("restore: a new empty DB with the same MASTER_KEY recovers buckets and objects from the pinned snapshot", async () => {
+    const masterKey = crypto.getRandomValues(new Uint8Array(32));
+    const first = await launch(makeConfig({ masterKey }));
+    const token = await createBucketViaBot("myapp");
+    expect((await putObject(first, "myapp", "docs/a.txt", token, "persisted")).status).toBe(201);
+    await first.stop();
+
+    const second = await launch(makeConfig({ masterKey }));
+    const get = await fetch(objectUrl(second, "myapp", "docs/a.txt"), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(get.status).toBe(200);
+    expect(await get.text()).toBe("persisted");
+  });
+
+  test("wrong MASTER_KEY refuses to start with a snapshot decrypt error", async () => {
+    const first = await launch(makeConfig());
+    await createBucketViaBot("myapp");
+    await first.stop();
+
+    await expect(createApp(makeConfig())).rejects.toThrow(/snapshot decrypt failed/);
+  });
+
+  test("a body over MAX_OBJECT_BYTES gets 413 before upload", async () => {
+    const app = await launch(makeConfig());
+    const token = await createBucketViaBot("myapp");
+    const before = sendDocumentCount();
+
+    const res = await putObject(app, "myapp", "big.bin", token, new Uint8Array(MAX_OBJECT_BYTES + 1));
+    expect(res.status).toBe(413);
+    expect(sendDocumentCount()).toBe(before);
+  });
+
+  test("a Telegram 429 on sendDocument is retried and the PUT still succeeds", async () => {
+    const app = await launch(makeConfig());
+    const token = await createBucketViaBot("myapp");
+    const before = sendDocumentCount();
+
+    fake.state.fail429.add("sendDocument");
+    const res = await putObject(app, "myapp", "retry.txt", token, "after rate limit");
+    expect(res.status).toBe(201);
+    expect(sendDocumentCount() - before).toBe(2);
+  }, 10_000);
+
+  test("listing filters by prefix and pages with the cursor", async () => {
+    const app = await launch(makeConfig());
+    const token = await createBucketViaBot("myapp");
+    for (const key of ["logs/a", "logs/b", "logs/c", "other/x"]) {
+      expect((await putObject(app, "myapp", key, token, key)).status).toBe(201);
+    }
+
+    const auth = { headers: { Authorization: `Bearer ${token}` } };
+    const base = `http://localhost:${app.port}/v1/buckets/myapp/objects`;
+
+    const page1 = (await (await fetch(`${base}?prefix=logs/&limit=2`, auth)).json()) as {
+      objects: { key: string }[];
+      nextCursor: string | null;
+    };
+    expect(page1.objects.map((o) => o.key)).toEqual(["logs/a", "logs/b"]);
+    expect(page1.nextCursor).not.toBeNull();
+
+    const page2 = (await (
+      await fetch(`${base}?prefix=logs/&limit=2&cursor=${encodeURIComponent(page1.nextCursor ?? "")}`, auth)
+    ).json()) as { objects: { key: string }[]; nextCursor: string | null };
+    expect(page2.objects.map((o) => o.key)).toEqual(["logs/c"]);
+    expect(page2.nextCursor).toBeNull();
+  });
+
+  test("owner uploads a photo to the bot with caption and gets the bytes back with image/jpeg", async () => {
+    const app = await launch(makeConfig());
+    const token = await createBucketViaBot("myapp");
+
+    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5]);
+    fake.state.files.set("photo-1", jpeg);
+    const before = fake.state.sent.length;
+    await fake.state.sendUpdate(
+      ownerMessage({
+        caption: "myapp pics/cat",
+        photo: [{ file_id: "photo-1", file_unique_id: "u1", width: 90, height: 90, file_size: jpeg.byteLength }],
+      }),
+    );
+    expect(fake.state.sent.slice(before).some((s) => s.text.startsWith("Stored"))).toBe(true);
+
+    const get = await fetch(objectUrl(app, "myapp", "pics/cat"), { headers: { Authorization: `Bearer ${token}` } });
+    expect(get.status).toBe(200);
+    expect(get.headers.get("content-type")).toBe("image/jpeg");
+    expect(new Uint8Array(await get.arrayBuffer())).toEqual(jpeg);
+  });
+});

@@ -1,81 +1,115 @@
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { loadConfig } from "../config";
-import { decryptBlob, importMasterKey, sha256Hex } from "../crypto";
-import { openDb, type ObjectRow } from "../db";
+import { decryptBlob, importMasterKey, partAad } from "../crypto";
+import { openDb, type ObjectRow, type PartRow } from "../db";
+import { errorText } from "../log";
 import { BotPool } from "../pool";
+import { TelegramError } from "../telegram";
 
-const out = process.argv[2];
-if (!out) {
-  console.error("usage: bun run export <out.ndjson>");
+const dir = process.argv[2];
+if (!dir) {
+  console.error("usage: bun run export <dir>");
   process.exit(2);
 }
+const indexPath = join(dir, "index.ndjson");
+if (existsSync(indexPath)) {
+  console.error(`export: ${indexPath} already exists`);
+  process.exit(2);
+}
+mkdirSync(dir, { recursive: true });
 
 // Read-only against Telegram and the index DB, so it is safe to run alongside the live service (WAL mode).
+// Takeover is a channel write, so it is paced like the service's own channel writes.
 const config = loadConfig();
 const db = openDb(config.dbPath);
-const pool = await BotPool.connect({ apiBase: config.apiBase, tokens: config.botTokens, minIntervalMs: 0 });
+const pool = await BotPool.connect({
+  apiBase: config.apiBase,
+  tokens: config.botTokens,
+  minIntervalMs: config.channelMinIntervalMs,
+});
 const key = await importMasterKey(config.masterKey);
-const writer = Bun.file(out).writer();
+const index = Bun.file(indexPath).writer();
 
-function errorLine(row: ObjectRow, err: unknown): string {
-  return JSON.stringify({ bucket: row.bucket, key: row.key, error: err instanceof Error ? err.message : String(err) }) + "\n";
+// Parts of one Telegram document are read with a single download. Rows arrive ordered by first message id,
+// so neighbouring objects hit this one-entry cache.
+let cached: { messageId: number; bytes: Uint8Array<ArrayBuffer> } | null = null;
+
+async function documentBytes(part: PartRow): Promise<Uint8Array<ArrayBuffer>> {
+  if (cached?.messageId === part.messageId) return cached.bytes;
+  const lane = pool.byBotId(part.botId);
+  let bytes: Uint8Array<ArrayBuffer> | null = null;
+  if (lane) {
+    try {
+      bytes = await lane.tg.downloadFile(part.fileId);
+    } catch (err) {
+      // 400 means the file id is not valid for this bot (it was stored by another one); fall back to takeover.
+      if (!(err instanceof TelegramError && err.code === 400)) throw err;
+    }
+  }
+  if (!bytes) {
+    const taken = await pool.takeOver(config.channelId, part.messageId);
+    bytes = await taken.lane.tg.downloadFile(taken.fileId);
+  }
+  cached = { messageId: part.messageId, bytes };
+  return bytes;
 }
 
-// Several objects can share one Telegram document, so rows are grouped by owning bot and file id (file ids are
-// per bot) and each file is downloaded once.
-const byFile = new Map<string, ObjectRow[]>();
-for (const row of db.allObjects()) {
-  const groupKey = `${row.botId}:${row.fileId}`;
-  const group = byFile.get(groupKey);
-  if (group) group.push(row);
-  else byFile.set(groupKey, [row]);
+// Streams the plaintext of an object into a temp file, hashing as it goes. The temp file is renamed into place
+// only when its hash matches the index, so a partial or corrupt blob never sits at a content-addressed path.
+async function materialize(row: ObjectRow, target: string): Promise<void> {
+  const tmp = `${target}.tmp`;
+  const writer = Bun.file(tmp).writer();
+  const hasher = new Bun.CryptoHasher("sha256");
+  try {
+    for (const part of db.getParts(row.objectId)) {
+      const doc = await documentBytes(part);
+      const enc = doc.subarray(part.blobOffset, part.blobOffset + part.blobLength);
+      const plain = await decryptBlob(key, partAad(row.objectId, part.partNo), enc);
+      hasher.update(plain);
+      writer.write(plain);
+    }
+    if (hasher.digest("hex") !== row.sha256) throw new Error("sha256 mismatch");
+    await writer.end();
+    renameSync(tmp, target);
+  } catch (err) {
+    await Promise.resolve(writer.end()).catch(() => undefined);
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 let ok = 0;
 let errors = 0;
-for (const rows of byFile.values()) {
-  const [first] = rows;
-  if (!first) continue;
-  let file: Uint8Array<ArrayBuffer>;
+for (const row of db.exportRows()) {
   try {
-    const lane = pool.byBotId(first.botId);
-    if (!lane) {
-      throw new Error(
-        `stored by bot ${first.botId}, which is not in TELEGRAM_BOT_TOKENS; start the service and GET it once to move it to a configured bot`,
-      );
+    const file = join("objects", row.sha256.slice(0, 2), row.sha256);
+    const target = join(dir, file);
+    // Content-addressed: an existing file under this hash is already the verified bytes, so it is reused.
+    if (!existsSync(target)) {
+      mkdirSync(dirname(target), { recursive: true });
+      await materialize(row, target);
     }
-    file = await lane.tg.downloadFile(first.fileId);
+    index.write(
+      JSON.stringify({
+        bucket: row.bucket,
+        key: row.key,
+        contentType: row.contentType,
+        size: row.size,
+        sha256: row.sha256,
+        updatedAt: new Date(row.updatedAt).toISOString(),
+        metadata: JSON.parse(row.meta),
+        file,
+      }) + "\n",
+    );
+    ok++;
   } catch (err) {
-    for (const row of rows) {
-      errors++;
-      writer.write(errorLine(row, err));
-    }
-    continue;
-  }
-  for (const row of rows) {
-    try {
-      const enc = file.slice(row.blobOffset, row.blobOffset + row.blobLength);
-      const body = await decryptBlob(key, row.objectId, enc);
-      if (sha256Hex(body) !== row.sha256) throw new Error("sha256 mismatch");
-      writer.write(
-        JSON.stringify({
-          bucket: row.bucket,
-          key: row.key,
-          contentType: row.contentType,
-          size: row.size,
-          sha256: row.sha256,
-          updatedAt: new Date(row.updatedAt).toISOString(),
-          data: Buffer.from(body).toString("base64"),
-        }) + "\n",
-      );
-      ok++;
-    } catch (err) {
-      errors++;
-      writer.write(errorLine(row, err));
-    }
+    errors++;
+    index.write(JSON.stringify({ bucket: row.bucket, key: row.key, error: errorText(err) }) + "\n");
   }
 }
 
-await writer.end();
+await index.end();
 db.close();
 console.log(`exported ${ok} objects, ${errors} errors`);
 process.exit(errors > 0 ? 1 : 0);

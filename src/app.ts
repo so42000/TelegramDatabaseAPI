@@ -1,15 +1,18 @@
+import { log } from "./log";
 import { createApiHandler } from "./api";
 import { Batcher } from "./batcher";
 import { Bot } from "./bot";
 import type { Config } from "./config";
-import { importMasterKey } from "./crypto";
+import { hashToken, importMasterKey } from "./crypto";
 import { openDb } from "./db";
 import { Snapshot } from "./snapshot";
-import { MAX_OBJECT_BYTES, Store } from "./store";
+import { Store } from "./store";
 import { BotPool, laneName } from "./pool";
 import type { TgChatFullInfo, TgChatMember } from "./telegram";
 
 const REQUEST_OVERHEAD_BYTES = 1024 * 1024;
+// Time given to in-flight requests (and the batches they wait on) before their sockets are closed.
+const SHUTDOWN_GRACE_MS = 20_000;
 
 export interface App {
   port: number;
@@ -55,6 +58,8 @@ export async function createApp(config: Config): Promise<App> {
 
   try {
     await snapshot.restoreIfEmpty();
+    const dropped = db.dropStagedParts();
+    if (dropped > 0) log.info(`startup: dropped ${dropped} staged parts from interrupted uploads`);
   } catch (err) {
     db.close();
     throw err;
@@ -66,15 +71,24 @@ export async function createApp(config: Config): Promise<App> {
       db,
       pool,
       channelId: config.channelId,
-      snapshot,
       maxPendingBytes: config.queueMaxBytes,
     });
-    const store = new Store({ db, pool, batcher, key, snapshot, channelId: config.channelId });
+    const store = new Store({
+      db,
+      pool,
+      batcher,
+      key,
+      snapshot,
+      channelId: config.channelId,
+      maxObjectBytes: config.maxObjectBytes,
+    });
     await store.claimUnownedObjects();
+    const adminTokenHash = config.adminToken === null ? null : hashToken(config.adminToken);
+    const api = createApiHandler({ store, snapshot, db, pool, batcher, adminTokenHash });
     const server = Bun.serve({
       port: config.port,
-      fetch: createApiHandler(store),
-      maxRequestBodySize: MAX_OBJECT_BYTES + REQUEST_OVERHEAD_BYTES,
+      fetch: api.fetch,
+      maxRequestBodySize: config.maxObjectBytes + REQUEST_OVERHEAD_BYTES,
     });
     const bots = pool.lanes.map(
       (lane) => new Bot({ tg: lane.tg, name: laneName(lane), store, snapshot, ownerIds: config.ownerIds }),
@@ -85,8 +99,20 @@ export async function createApp(config: Config): Promise<App> {
     return {
       port: server.port,
       stop: async () => {
-        await Promise.all(bots.map((bot) => bot.stop()));
-        server.stop(true);
+        await Promise.all([
+          (async () => {
+            void server.stop(false); // stop accepting; the promise is not awaited because it waits for open connections
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const timedOut = new Promise<false>((resolve) => {
+              timer = setTimeout(() => resolve(false), SHUTDOWN_GRACE_MS);
+            });
+            const drained = await Promise.race([api.drain().then(() => true), timedOut]);
+            clearTimeout(timer);
+            await server.stop(true);
+            if (!drained) await api.drain();
+          })(),
+          ...bots.map((bot) => bot.stop()),
+        ]);
         await snapshot.stop();
         db.close();
       },

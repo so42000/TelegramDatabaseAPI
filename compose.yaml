@@ -7,4 +7,6 @@ services:
     volumes:
       - ./data:/data
     restart: unless-stopped
-    stop_grace_period: 30s
+    environment:
+      DB_PATH: /data/index.sqlite
+    stop_grace_period: 60s

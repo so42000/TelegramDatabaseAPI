@@ -9,6 +9,8 @@ export interface Config {
   snapshotIntervalMs: number;
   channelMinIntervalMs: number;
   queueMaxBytes: number;
+  maxObjectBytes: number;
+  adminToken: string | null;
   botPolling: boolean;
 }
 
@@ -52,6 +54,16 @@ function parseBotTokens(env: Env): string[] {
   return tokens;
 }
 
+const ADMIN_TOKEN_RE = /^[\x21-\x7e]{32,256}$/;
+
+// Unset means the admin API is off.
+function parseAdminToken(env: Env): string | null {
+  const v = read(env, "ADMIN_TOKEN");
+  if (v === undefined) return null;
+  if (!ADMIN_TOKEN_RE.test(v)) fail("ADMIN_TOKEN", "must be 32-256 printable ASCII characters without spaces");
+  return v;
+}
+
 export function loadConfig(env: Env = process.env): Config {
   const ownerIds = new Set<number>();
   for (const part of required(env, "OWNER_IDS").split(",")) {
@@ -76,6 +88,8 @@ export function loadConfig(env: Env = process.env): Config {
     snapshotIntervalMs: intVar(env, "SNAPSHOT_INTERVAL_MS", 60_000, 1),
     channelMinIntervalMs: intVar(env, "CHANNEL_MIN_INTERVAL_MS", 3_000, 0),
     queueMaxBytes: intVar(env, "QUEUE_MAX_BYTES", 67_108_864, 1),
+    maxObjectBytes: intVar(env, "MAX_OBJECT_BYTES", 5_368_709_120, 1),
+    adminToken: parseAdminToken(env),
     botPolling: read(env, "BOT_POLLING") !== "false",
   };
 }

@@ -1,3 +1,4 @@
+import { errorText, log } from "./log";
 import { createApp, type App } from "./app";
 import { loadConfig } from "./config";
 
@@ -5,11 +6,11 @@ let app: App;
 try {
   app = await createApp(loadConfig());
 } catch (err) {
-  console.error(err instanceof Error ? err.message : String(err));
+  log.error(errorText(err));
   process.exit(1);
 }
 
-console.log(`listening on :${app.port}`);
+log.info(`listening on :${app.port}`, { port: app.port });
 
 let stopping = false;
 async function shutdown(): Promise<void> {

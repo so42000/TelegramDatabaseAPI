@@ -1,4 +1,6 @@
-import { SerialQueue, TelegramClient, TelegramError, type TgUser } from "./telegram";
+import { errorText, log } from "./log";
+import { SerialQueue, TelegramClient, TelegramError, type TgMessage, type TgUser } from "./telegram";
+import { botsDisabled } from "./metrics";
 
 export interface BotLane {
   readonly index: number; // 0-based position in TELEGRAM_BOT_TOKENS
@@ -7,10 +9,6 @@ export interface BotLane {
   readonly tg: TelegramClient;
   readonly queue: SerialQueue; // this bot's channel writes, CHANNEL_MIN_INTERVAL_MS apart
   disabled: boolean;
-}
-
-function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 export function laneName(lane: BotLane): string {
@@ -40,7 +38,7 @@ export class BotPool {
             disabled: false,
           };
         } catch (err) {
-          throw new Error(`bot #${index + 1}: ${messageOf(err)}`);
+          throw new Error(`bot #${index + 1}: ${errorText(err)}`);
         }
       }),
     );
@@ -64,6 +62,16 @@ export class BotPool {
     return this.lanes.find((l) => !l.disabled && l.botId === botId);
   }
 
+  // Enabled lanes and how many of them answered their last request.
+  health(): { total: number; enabled: number; reachable: number } {
+    const enabled = this.lanes.filter((lane) => !lane.disabled);
+    return {
+      total: this.lanes.length,
+      enabled: enabled.length,
+      reachable: enabled.filter((lane) => lane.tg.reachable).length,
+    };
+  }
+
   // Lane whose next write can start soonest. Ties go to the lower index.
   pickWriter(): BotLane {
     let best: BotLane | undefined;
@@ -85,7 +93,32 @@ export class BotPool {
     if (lane.disabled) return true;
     if (this.lanes.filter((l) => !l.disabled).length === 1) return false;
     lane.disabled = true;
-    console.error(`${laneName(lane)} disabled: ${messageOf(err)}`);
+    botsDisabled.inc({});
+    log.error(`${laneName(lane)} disabled`, { err: errorText(err) });
     return true;
+  }
+
+  // File ids work only for the bot that received them. Editing a batch message's caption (allowed for any
+  // channel admin with Edit rights) returns the message with a file_id for the editing bot, which then owns
+  // every part in it. Captions are random UUIDs, so the edit reveals nothing.
+  async takeOver(channelId: string, messageId: number): Promise<{ lane: BotLane; fileId: string }> {
+    for (;;) {
+      const lane = this.pickWriter();
+      let msg: TgMessage;
+      try {
+        msg = await lane.queue.run(() =>
+          lane.tg.call<TgMessage>("editMessageCaption", {
+            chat_id: channelId,
+            message_id: messageId,
+            caption: crypto.randomUUID(),
+          }),
+        );
+      } catch (err) {
+        if (isBotLost(err) && this.disable(lane, err)) continue;
+        throw err;
+      }
+      if (!msg.document) throw new Error(`message ${messageId} has no document`);
+      return { lane, fileId: msg.document.file_id };
+    }
   }
 }

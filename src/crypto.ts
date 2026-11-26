@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 
 const VERSION = 0x01;
 const IV_LEN = 12;
@@ -57,8 +57,10 @@ export function hashToken(token: string): string {
   return sha256Hex(token);
 }
 
-export function tokenMatches(token: string, hashHex: string): boolean {
-  const a = Buffer.from(hashToken(token), "hex");
-  const b = Buffer.from(hashHex, "hex");
-  return a.byteLength === b.byteLength && timingSafeEqual(a, b);
+export function partAad(objectId: string, partNo: number): string {
+  return partNo === 0 ? objectId : `${objectId}:${partNo}`;
+}
+
+export function newKeyId(): string {
+  return "key_" + Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex");
 }

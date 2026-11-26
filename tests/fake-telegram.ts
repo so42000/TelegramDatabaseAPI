@@ -38,6 +38,7 @@ export interface FakeState {
   deleted: number[];
   sent: SentMessage[];
   fail429: Set<string>;
+  retryAfterS: number;
   // file_id -> bot that can use it. Files with no entry are fixtures every bot can read.
   fileOwners: Map<string, number>;
   // Bots whose token is revoked: every call and file download returns 401.
@@ -117,6 +118,7 @@ export function startFakeTelegram(): FakeTelegram {
     deleted: [],
     sent: [],
     fail429: new Set(),
+    retryAfterS: 1,
     fileOwners: new Map(),
     lostBots: new Set(),
     sendUpdate: (message, botId = FAKE_BOT_ID) => {
@@ -302,7 +304,7 @@ export function startFakeTelegram(): FakeTelegram {
     }
     if (state.fail429.delete(method)) {
       return json(
-        { ok: false, error_code: 429, description: "Too Many Requests: retry later", parameters: { retry_after: 1 } },
+        { ok: false, error_code: 429, description: "Too Many Requests: retry later", parameters: { retry_after: state.retryAfterS } },
         429,
       );
     }

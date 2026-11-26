@@ -1,6 +1,7 @@
 import type { IndexDb, ObjectRow } from "./db";
 import { decryptBlob, encryptBlob, hashToken, newBucketToken, sha256Hex, tokenMatches } from "./crypto";
-import { SerialQueue, type TgMessage, type TelegramClient } from "./telegram";
+import { NoSuchBucketError, type Batcher, type Dirtyable } from "./batcher";
+import type { TelegramClient } from "./telegram";
 
 // Stays below the 20 MB getFile cap even with the 29-byte encryption overhead.
 export const MAX_OBJECT_BYTES = 19 * 1024 * 1024;
@@ -23,12 +24,6 @@ export function keyError(key: string): string | null {
 export class TooLargeError extends Error {
   name = "TooLargeError";
 }
-export class QueueFullError extends Error {
-  name = "QueueFullError";
-}
-export class NoSuchBucketError extends Error {
-  name = "NoSuchBucketError";
-}
 export class InvalidNameError extends Error {
   name = "InvalidNameError";
 }
@@ -37,24 +32,6 @@ export class BucketExistsError extends Error {
 }
 export class IntegrityError extends Error {
   name = "IntegrityError";
-}
-
-// Serializes operations on the same key so concurrent PUTs cannot leak messages.
-export class KeyedLock {
-  private readonly tails = new Map<string, Promise<void>>();
-
-  run<T>(k: string, fn: () => Promise<T>): Promise<T> {
-    const job = (this.tails.get(k) ?? Promise.resolve()).then(fn);
-    const tail = job.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.tails.set(k, tail);
-    void tail.then(() => {
-      if (this.tails.get(k) === tail) this.tails.delete(k);
-    });
-    return job;
-  }
 }
 
 export interface ObjectMeta {
@@ -77,23 +54,15 @@ function toMeta(row: ObjectRow): ObjectMeta {
   };
 }
 
-export interface Dirtyable {
-  markDirty(): void;
-}
-
 export interface StoreDeps {
   db: IndexDb;
   tg: TelegramClient;
-  channelQueue: SerialQueue;
-  channelId: string;
+  batcher: Batcher;
   key: CryptoKey;
   snapshot: Dirtyable;
-  queueMax: number;
 }
 
 export class Store {
-  private readonly locks = new KeyedLock();
-
   constructor(private readonly deps: StoreDeps) {}
 
   authorize(bucket: string, token: string): boolean {
@@ -107,67 +76,41 @@ export class Store {
     body: Uint8Array<ArrayBuffer>,
     contentType: string,
   ): Promise<{ created: boolean; meta: ObjectMeta }> {
-    const { db, tg, channelQueue, channelId, key: masterKey, snapshot, queueMax } = this.deps;
+    const { db, key: masterKey, batcher } = this.deps;
     if (body.byteLength > MAX_OBJECT_BYTES) throw new TooLargeError("object too large");
     if (!db.getBucket(bucket)) throw new NoSuchBucketError("no such bucket");
-    if (channelQueue.depth >= queueMax) throw new QueueFullError("channel queue full");
 
-    return this.locks.run(`${bucket}\u0000${key}`, async () => {
-      const objectId = crypto.randomUUID();
-      const enc = await encryptBlob(masterKey, objectId, body);
-      const form = new FormData();
-      form.set("chat_id", channelId);
-      form.set("document", new Blob([enc]), `${objectId}.bin`);
-      form.set("caption", objectId);
-      form.set("disable_notification", "true");
-
-      const msg = await channelQueue.run(() => tg.callMultipart<TgMessage>("sendDocument", form));
-      if (!msg.document) throw new Error("sendDocument returned no document");
-
-      const row: ObjectRow = {
+    const objectId = crypto.randomUUID();
+    const enc = await encryptBlob(masterKey, objectId, body);
+    const { created, row } = await batcher.enqueue(
+      {
         bucket,
         key,
         objectId,
-        messageId: msg.message_id,
-        fileId: msg.document.file_id,
         contentType: contentType.slice(0, 255),
         size: body.byteLength,
         sha256: sha256Hex(body),
-        updatedAt: Date.now(),
-      };
-
-      let previous: ObjectRow | null;
-      try {
-        previous = db.upsertObject(row);
-      } catch (err) {
-        try {
-          await tg.call("deleteMessage", { chat_id: channelId, message_id: msg.message_id });
-        } catch (delErr) {
-          console.error(`orphan message ${msg.message_id} kept: ${String(delErr)}`);
-        }
-        throw err;
-      }
-      snapshot.markDirty();
-      return { created: previous === null, meta: toMeta(row) };
-    });
+      },
+      enc,
+    );
+    return { created, meta: toMeta(row) };
   }
 
   async get(bucket: string, key: string): Promise<{ meta: ObjectMeta; body: Uint8Array<ArrayBuffer> } | null> {
     const row = this.deps.db.getObject(bucket, key);
     if (!row) return null;
-    const enc = await this.deps.tg.downloadFile(row.fileId);
+    const enc = await this.deps.tg.downloadFile(row.fileId, { offset: row.blobOffset, length: row.blobLength });
     const body = await decryptBlob(this.deps.key, row.objectId, enc);
     if (sha256Hex(body) !== row.sha256) throw new IntegrityError("sha256 mismatch");
     return { meta: toMeta(row), body };
   }
 
-  delete(bucket: string, key: string): Promise<boolean> {
-    return this.locks.run(`${bucket}\u0000${key}`, async () => {
-      const prev = this.deps.db.deleteObject(bucket, key);
-      if (!prev) return false;
-      this.deps.snapshot.markDirty();
-      return true;
-    });
+  // Concurrent PUT and DELETE on the same key have no guaranteed order.
+  delete(bucket: string, key: string): boolean {
+    const prev = this.deps.db.deleteObject(bucket, key);
+    if (!prev) return false;
+    this.deps.snapshot.markDirty();
+    return true;
   }
 
   list(

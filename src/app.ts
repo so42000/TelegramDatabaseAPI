@@ -1,4 +1,5 @@
 import { createApiHandler } from "./api";
+import { Batcher } from "./batcher";
 import { Bot } from "./bot";
 import type { Config } from "./config";
 import { importMasterKey } from "./crypto";
@@ -55,15 +56,15 @@ export async function createApp(config: Config): Promise<App> {
   snapshot.start();
 
   try {
-    const store = new Store({
+    const batcher = new Batcher({
       db,
       tg,
       channelQueue,
       channelId: config.channelId,
-      key,
       snapshot,
-      queueMax: config.queueMax,
+      maxPendingBytes: config.queueMaxBytes,
     });
+    const store = new Store({ db, tg, batcher, key, snapshot });
     const server = Bun.serve({
       port: config.port,
       fetch: createApiHandler(store),

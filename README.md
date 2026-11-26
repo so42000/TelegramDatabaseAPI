@@ -48,7 +48,7 @@ Keep this key safe and outside the container. Without it, the encrypted snapshot
 | `TELEGRAM_API_BASE` | no | `https://api.telegram.org` | Bot API base URL |
 | `SNAPSHOT_INTERVAL_MS` | no | `60000` | Index snapshot interval |
 | `CHANNEL_MIN_INTERVAL_MS` | no | `3000` | Minimum gap between channel writes; raise to `4000` if you see repeated 429s |
-| `QUEUE_MAX` | no | `20` | Pending channel writes before the API returns 503 |
+| `QUEUE_MAX_BYTES` | no | `67108864` | Pending PUT bytes waiting for the channel before the API returns 503 |
 | `BOT_POLLING` | no | `true` | Set `false` to disable the bot |
 
 ## 3. Run

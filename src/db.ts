@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { BLOB_OVERHEAD } from "./crypto";
 
 export interface ObjectRow {
   bucket: string;
@@ -11,6 +12,9 @@ export interface ObjectRow {
   contentType: string;
   size: number;
   sha256: string;
+  // Byte range of this object's encrypted blob inside the Telegram document.
+  blobOffset: number;
+  blobLength: number;
   updatedAt: number;
 }
 
@@ -21,11 +25,13 @@ export interface BucketRow {
 }
 
 export interface IndexSnapshot {
-  v: 1;
+  v: 2;
   createdAt: number;
   buckets: BucketRow[];
   objects: ObjectRow[];
 }
+
+export type CommitResult = "created" | "replaced" | "no_bucket";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS buckets (name TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -33,13 +39,15 @@ CREATE TABLE IF NOT EXISTS objects (
   bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
   key TEXT NOT NULL, object_id TEXT NOT NULL, message_id INTEGER NOT NULL, file_id TEXT NOT NULL,
   content_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  blob_offset INTEGER NOT NULL DEFAULT 0, blob_length INTEGER NOT NULL,
   PRIMARY KEY (bucket, key));
 CREATE TABLE IF NOT EXISTS pending_deletes (message_id INTEGER PRIMARY KEY, queued_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 `;
 
 const OBJECT_COLS = `bucket, key, object_id AS objectId, message_id AS messageId, file_id AS fileId,
-  content_type AS contentType, size, sha256, updated_at AS updatedAt`;
+  content_type AS contentType, size, sha256, updated_at AS updatedAt,
+  blob_offset AS blobOffset, blob_length AS blobLength`;
 
 const BUCKET_COLS = `name, token_hash AS tokenHash, created_at AS createdAt`;
 
@@ -85,12 +93,12 @@ export class IndexDb {
     return this.db.transaction(() => {
       if (!this.db.query("SELECT 1 FROM buckets WHERE name = ?").get(name)) return -1;
       const count = this.db.query("SELECT COUNT(*) AS n FROM objects WHERE bucket = ?").get(name) as { n: number };
-      this.db
-        .query(
-          "INSERT OR IGNORE INTO pending_deletes (message_id, queued_at) SELECT message_id, ? FROM objects WHERE bucket = ?",
-        )
-        .run(Date.now(), name);
+      const ids = (
+        this.db.query("SELECT DISTINCT message_id AS id FROM objects WHERE bucket = ?").all(name) as { id: number }[]
+      ).map((r) => r.id);
       this.db.query("DELETE FROM buckets WHERE name = ?").run(name);
+      const now = Date.now();
+      for (const id of ids) this.queueIfUnreferenced(id, now);
       return count.n;
     })();
   }
@@ -101,44 +109,55 @@ export class IndexDb {
       .get(bucket, key) as ObjectRow | null;
   }
 
-  // Returns the replaced row (its message is queued for deletion), or null.
-  upsertObject(row: ObjectRow): ObjectRow | null {
+  // Applies rows stored in one Telegram message, in order; later rows win over earlier ones
+  // with the same key. Results match `rows` by index. Messages that no longer have any
+  // referencing object are queued for deletion.
+  commitBatch(messageId: number, rows: ObjectRow[]): CommitResult[] {
     return this.db.transaction(() => {
-      const prev = this.getObject(row.bucket, row.key);
-      this.db
-        .query(
-          `INSERT OR REPLACE INTO objects (bucket, key, object_id, message_id, file_id, content_type, size, sha256, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          row.bucket,
-          row.key,
-          row.objectId,
-          row.messageId,
-          row.fileId,
-          row.contentType,
-          row.size,
-          row.sha256,
-          row.updatedAt,
-        );
-      if (prev) {
+      const touched = new Set<number>();
+      const results: CommitResult[] = [];
+      for (const row of rows) {
+        if (!this.db.query("SELECT 1 FROM buckets WHERE name = ?").get(row.bucket)) {
+          results.push("no_bucket");
+          continue;
+        }
+        const prev = this.getObject(row.bucket, row.key);
         this.db
-          .query("INSERT OR IGNORE INTO pending_deletes (message_id, queued_at) VALUES (?, ?)")
-          .run(prev.messageId, Date.now());
+          .query(
+            `INSERT OR REPLACE INTO objects (bucket, key, object_id, message_id, file_id, content_type, size, sha256,
+               updated_at, blob_offset, blob_length)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            row.bucket,
+            row.key,
+            row.objectId,
+            row.messageId,
+            row.fileId,
+            row.contentType,
+            row.size,
+            row.sha256,
+            row.updatedAt,
+            row.blobOffset,
+            row.blobLength,
+          );
+        if (prev) touched.add(prev.messageId);
+        results.push(prev ? "replaced" : "created");
       }
-      return prev;
+      touched.add(messageId);
+      const now = Date.now();
+      for (const id of touched) this.queueIfUnreferenced(id, now);
+      return results;
     })();
   }
 
-  // Returns the deleted row (its message is queued for deletion), or null.
+  // Returns the deleted row (its message is queued if unreferenced), or null.
   deleteObject(bucket: string, key: string): ObjectRow | null {
     return this.db.transaction(() => {
       const prev = this.getObject(bucket, key);
       if (!prev) return null;
       this.db.query("DELETE FROM objects WHERE bucket = ? AND key = ?").run(bucket, key);
-      this.db
-        .query("INSERT OR IGNORE INTO pending_deletes (message_id, queued_at) VALUES (?, ?)")
-        .run(prev.messageId, Date.now());
+      this.queueIfUnreferenced(prev.messageId, Date.now());
       return prev;
     })();
   }
@@ -183,15 +202,16 @@ export class IndexDb {
       .run(k, v);
   }
 
-  loadSnapshot(s: IndexSnapshot): void {
+  loadSnapshot(s: { buckets: BucketRow[]; objects: ObjectRow[] }): void {
     this.db.transaction(() => {
       const insBucket = this.db.query(
         "INSERT INTO buckets (name, token_hash, created_at) VALUES (?, ?, ?)",
       );
       for (const b of s.buckets) insBucket.run(b.name, b.tokenHash, b.createdAt);
       const insObject = this.db.query(
-        `INSERT INTO objects (bucket, key, object_id, message_id, file_id, content_type, size, sha256, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO objects (bucket, key, object_id, message_id, file_id, content_type, size, sha256, updated_at,
+           blob_offset, blob_length)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const o of s.objects) {
         insObject.run(
@@ -204,6 +224,8 @@ export class IndexDb {
           o.size,
           o.sha256,
           o.updatedAt,
+          o.blobOffset,
+          o.blobLength,
         );
       }
     })();
@@ -212,6 +234,32 @@ export class IndexDb {
   close(): void {
     this.db.close();
   }
+
+  // A message is deleted only once no object references it. Callers run inside a transaction.
+  private queueIfUnreferenced(messageId: number, now: number): void {
+    const referenced = this.db.query("SELECT 1 FROM objects WHERE message_id = ? LIMIT 1").get(messageId);
+    if (!referenced) {
+      this.db
+        .query("INSERT OR IGNORE INTO pending_deletes (message_id, queued_at) VALUES (?, ?)")
+        .run(messageId, now);
+    }
+  }
+}
+
+// Adds blob columns to a pre-batching `objects` table. Legacy objects each own a whole
+// single-object document, so offset is 0 and length is the encrypted size.
+function migrate(db: Database): void {
+  const cols = db.query("PRAGMA table_info(objects)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "blob_offset")) {
+    db.transaction(() => {
+      db.exec(
+        `ALTER TABLE objects ADD COLUMN blob_offset INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE objects ADD COLUMN blob_length INTEGER NOT NULL DEFAULT 0;
+         UPDATE objects SET blob_length = size + ${BLOB_OVERHEAD};`,
+      );
+    })();
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS objects_message_id ON objects(message_id)");
 }
 
 export function openDb(path: string): IndexDb {
@@ -219,5 +267,6 @@ export function openDb(path: string): IndexDb {
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
   db.exec(SCHEMA);
+  migrate(db);
   return new IndexDb(db);
 }

@@ -70,6 +70,11 @@ interface Envelope<T> {
   parameters?: { retry_after?: number };
 }
 
+export interface ByteRange {
+  offset: number;
+  length: number;
+}
+
 const MAX_RATE_LIMIT_ATTEMPTS = 5;
 const MAX_TRANSIENT_ATTEMPTS = 3;
 const FILE_CACHE_TTL_MS = 50 * 60_000;
@@ -103,15 +108,17 @@ export class TelegramClient {
     return this.request<T>(method, { method: "POST", body: form });
   }
 
-  async downloadFile(fileId: string): Promise<Uint8Array<ArrayBuffer>> {
+  // With `range`, returns exactly those bytes. If the file server ignores Range and returns the
+  // whole file, the range is sliced locally.
+  async downloadFile(fileId: string, range?: ByteRange): Promise<Uint8Array<ArrayBuffer>> {
     const cached = this.fileCache.get(fileId);
     if (cached && cached.expiresAt > Date.now()) {
-      const first = await this.fetchFile(cached.path);
+      const first = await this.fetchFile(cached.path, range);
       if (first.ok) return first.bytes;
       this.fileCache.delete(fileId);
     }
     const path = await this.resolveFilePath(fileId);
-    const second = await this.fetchFile(path);
+    const second = await this.fetchFile(path, range);
     if (second.ok) return second.bytes;
     throw new TelegramError("download", second.status, "file download failed");
   }
@@ -123,11 +130,19 @@ export class TelegramClient {
     return file.file_path;
   }
 
-  private async fetchFile(path: string): Promise<{ ok: true; bytes: Uint8Array<ArrayBuffer> } | { ok: false; status: number }> {
+  private async fetchFile(
+    path: string,
+    range?: ByteRange,
+  ): Promise<{ ok: true; bytes: Uint8Array<ArrayBuffer> } | { ok: false; status: number }> {
     try {
-      const res = await fetch(`${this.apiBase}/file/bot${this.token}/${path}`);
+      const headers = range ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : undefined;
+      const res = await fetch(`${this.apiBase}/file/bot${this.token}/${path}`, { headers });
       if (!res.ok) return { ok: false, status: res.status };
-      return { ok: true, bytes: new Uint8Array(await res.arrayBuffer()) };
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (!range) return { ok: true, bytes };
+      const part = res.status === 206 ? bytes : bytes.slice(range.offset, range.offset + range.length);
+      if (part.byteLength !== range.length) return { ok: false, status: res.status };
+      return { ok: true, bytes: part };
     } catch {
       return { ok: false, status: 0 };
     }
@@ -177,26 +192,16 @@ export class TelegramClient {
 
 export class SerialQueue {
   private tail: Promise<void> = Promise.resolve();
-  private pending = 0;
   private lastStart = -Infinity;
 
   constructor(private readonly minIntervalMs: number) {}
 
-  get depth(): number {
-    return this.pending;
-  }
-
   run<T>(fn: () => Promise<T>): Promise<T> {
-    this.pending++;
     const job = this.tail.then(async () => {
       const wait = this.lastStart + this.minIntervalMs - Date.now();
       if (wait > 0) await sleep(wait);
       this.lastStart = Date.now();
-      try {
-        return await fn();
-      } finally {
-        this.pending--;
-      }
+      return fn();
     });
     this.tail = job.then(
       () => undefined,

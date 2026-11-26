@@ -8,7 +8,7 @@ export interface Config {
   apiBase: string;
   snapshotIntervalMs: number;
   channelMinIntervalMs: number;
-  queueMax: number;
+  queueMaxBytes: number;
   botPolling: boolean;
 }
 
@@ -61,7 +61,7 @@ export function loadConfig(env: Env = process.env): Config {
     apiBase: read(env, "TELEGRAM_API_BASE") ?? "https://api.telegram.org",
     snapshotIntervalMs: intVar(env, "SNAPSHOT_INTERVAL_MS", 60_000, 1),
     channelMinIntervalMs: intVar(env, "CHANNEL_MIN_INTERVAL_MS", 3_000, 0),
-    queueMax: intVar(env, "QUEUE_MAX", 20, 1),
+    queueMaxBytes: intVar(env, "QUEUE_MAX_BYTES", 67_108_864, 1),
     botPolling: read(env, "BOT_POLLING") !== "false",
   };
 }

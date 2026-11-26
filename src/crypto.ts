@@ -3,7 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 const VERSION = 0x01;
 const IV_LEN = 12;
 const HEADER_LEN = 1 + IV_LEN;
-const MIN_BLOB_LEN = HEADER_LEN + 16;
+export const BLOB_OVERHEAD = HEADER_LEN + 16;
 const encoder = new TextEncoder();
 
 export class DecryptError extends Error {
@@ -31,7 +31,7 @@ export async function encryptBlob(key: CryptoKey, aad: string, plain: Uint8Array
 }
 
 export async function decryptBlob(key: CryptoKey, aad: string, blob: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
-  if (blob.byteLength < MIN_BLOB_LEN) throw new DecryptError("blob too short");
+  if (blob.byteLength < BLOB_OVERHEAD) throw new DecryptError("blob too short");
   if (blob[0] !== VERSION) throw new DecryptError("unsupported blob version");
   try {
     const plain = await crypto.subtle.decrypt(

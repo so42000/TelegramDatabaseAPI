@@ -3,9 +3,9 @@ import {
   InvalidNameError,
   keyError,
   MAX_OBJECT_BYTES,
-  NoSuchBucketError,
   Store,
 } from "./store";
+import { NoSuchBucketError } from "./batcher";
 import type { Snapshot } from "./snapshot";
 import type { TelegramClient, TgMessage, TgUpdate } from "./telegram";
 
@@ -223,7 +223,7 @@ export class Bot {
   }
 
   private async rm(chatId: number, bucket: string, key: string): Promise<void> {
-    const deleted = await this.deps.store.delete(bucket, key);
+    const deleted = this.deps.store.delete(bucket, key);
     return this.reply(chatId, deleted ? "Deleted." : "Not found.");
   }
 

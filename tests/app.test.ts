@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { createApp, type App } from "../src/app";
 import type { Config } from "../src/config";
 import { MAX_OBJECT_BYTES } from "../src/store";
+import { encryptBlob, hashToken, importMasterKey, newBucketToken, sha256Hex } from "../src/crypto";
+import { SNAPSHOT_AAD, SNAPSHOT_CAPTION } from "../src/snapshot";
 import { FAKE_CHANNEL_ID, startFakeTelegram, type FakeTelegram } from "./fake-telegram";
 
 const TOKEN_RE = /tgs_[A-Za-z0-9_-]{43}/;
@@ -37,7 +39,7 @@ function makeConfig(over: Partial<Config> = {}): Config {
     apiBase: fake.apiBase,
     snapshotIntervalMs: 3_600_000,
     channelMinIntervalMs: 0,
-    queueMax: 20,
+    queueMaxBytes: 67_108_864,
     botPolling: true,
     ...over,
   };
@@ -249,5 +251,91 @@ describe("tg storage app", () => {
     expect(get.status).toBe(200);
     expect(get.headers.get("content-type")).toBe("image/jpeg");
     expect(new Uint8Array(await get.arrayBuffer())).toEqual(jpeg);
+  });
+
+  test("PUTs that share one channel slot are stored in a single sendDocument", async () => {
+    const app = await launch(makeConfig({ channelMinIntervalMs: 1000 }));
+    const token = await createBucketViaBot("myapp");
+    expect((await putObject(app, "myapp", "warm", token, "warm")).status).toBe(201);
+
+    const before = sendDocumentCount();
+    const puts = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => putObject(app, "myapp", `k${i}`, token, `body-${i}`)),
+    );
+    expect(puts.map((r) => r.status)).toEqual(Array(10).fill(201));
+    expect(sendDocumentCount() - before).toBe(1);
+
+    for (let i = 0; i < 10; i++) {
+      const get = await fetch(objectUrl(app, "myapp", `k${i}`), { headers: { Authorization: `Bearer ${token}` } });
+      expect(await get.text()).toBe(`body-${i}`);
+    }
+  }, 10_000);
+
+  test("a shared batch message is deleted only after its last object is replaced", async () => {
+    const app = await launch(makeConfig({ channelMinIntervalMs: 1000 }));
+    const token = await createBucketViaBot("myapp");
+    expect((await putObject(app, "myapp", "warm", token, "warm")).status).toBe(201);
+
+    const [a, b] = await Promise.all([
+      putObject(app, "myapp", "a", token, "a"),
+      putObject(app, "myapp", "b", token, "b"),
+    ]);
+    expect([a.status, b.status]).toEqual([201, 201]);
+    const batch = [...fake.state.messages.keys()].at(-1);
+    if (batch === undefined) throw new Error("no batch message");
+
+    expect((await putObject(app, "myapp", "a", token, "a2")).status).toBe(200);
+    await createBucketViaBot("flush1");
+    expect(fake.state.deleted).not.toContain(batch);
+    const getB = await fetch(objectUrl(app, "myapp", "b"), { headers: { Authorization: `Bearer ${token}` } });
+    expect(await getB.text()).toBe("b");
+
+    expect((await putObject(app, "myapp", "b", token, "b2")).status).toBe(200);
+    await createBucketViaBot("flush2");
+    expect(fake.state.deleted).toContain(batch);
+  }, 15_000);
+
+  test("restores a v1 snapshot whose objects each own a whole Telegram document", async () => {
+    const masterKey = crypto.getRandomValues(new Uint8Array(32));
+    const key = await importMasterKey(masterKey);
+    const token = newBucketToken();
+    const objectId = crypto.randomUUID();
+    const body = new TextEncoder().encode("legacy");
+    fake.state.files.set("legacy-obj", await encryptBlob(key, objectId, body));
+
+    const snapshot = {
+      v: 1,
+      createdAt: Date.now(),
+      buckets: [{ name: "old", tokenHash: hashToken(token), createdAt: 1 }],
+      objects: [
+        {
+          bucket: "old",
+          key: "x",
+          objectId,
+          messageId: 501,
+          fileId: "legacy-obj",
+          contentType: "text/plain",
+          size: body.byteLength,
+          sha256: sha256Hex(body),
+          updatedAt: 1,
+        },
+      ],
+    };
+    const payload = Bun.gzipSync(new TextEncoder().encode(JSON.stringify(snapshot)));
+    fake.state.files.set("legacy-snap", await encryptBlob(key, SNAPSHOT_AAD, payload));
+    fake.state.messages.set(500, {
+      message_id: 500,
+      date: 0,
+      chat: { id: Number(FAKE_CHANNEL_ID), type: "channel" },
+      caption: SNAPSHOT_CAPTION,
+      document: { file_id: "legacy-snap", file_unique_id: "legacy-snap", file_size: 1 },
+    });
+    fake.state.pinned = 500;
+
+    const app = await launch(makeConfig({ masterKey }));
+    const get = await fetch(objectUrl(app, "old", "x"), { headers: { Authorization: `Bearer ${token}` } });
+    expect(get.status).toBe(200);
+    expect(get.headers.get("content-type")).toBe("text/plain");
+    expect(await get.text()).toBe("legacy");
   });
 });

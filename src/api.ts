@@ -3,11 +3,10 @@ import {
   IntegrityError,
   keyError,
   MAX_OBJECT_BYTES,
-  NoSuchBucketError,
-  QueueFullError,
   Store,
   TooLargeError,
 } from "./store";
+import { NoSuchBucketError, QueueFullError } from "./batcher";
 
 const OBJECT_PATH = /^\/v1\/buckets\/([^/]+)\/objects(?:\/(.+))?$/;
 
@@ -110,5 +109,5 @@ async function putObject(store: Store, req: Request, bucket: string, key: string
 }
 
 async function deleteObject(store: Store, bucket: string, key: string): Promise<Response> {
-  return (await store.delete(bucket, key)) ? new Response(null, { status: 204 }) : notFound();
+  return store.delete(bucket, key) ? new Response(null, { status: 204 }) : notFound();
 }

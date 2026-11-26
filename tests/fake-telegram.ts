@@ -206,7 +206,15 @@ export function startFakeTelegram(): FakeTelegram {
     const fileMatch = /^\/file\/bot[^/]+\/(.+)$/.exec(path);
     if (fileMatch && req.method === "GET") {
       const bytes = state.files.get(decodeURIComponent(fileMatch[1] ?? ""));
-      return bytes ? new Response(bytes) : new Response("not found", { status: 404 });
+      if (!bytes) return new Response("not found", { status: 404 });
+      const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.get("range") ?? "");
+      if (!range) return new Response(bytes);
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      return new Response(bytes.slice(start, end + 1), {
+        status: 206,
+        headers: { "content-range": `bytes ${start}-${end}/${bytes.byteLength}` },
+      });
     }
 
     const callMatch = /^\/bot[^/]+\/([A-Za-z]+)$/.exec(path);

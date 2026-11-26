@@ -1,4 +1,4 @@
-import { DecryptError, decryptBlob, encryptBlob } from "./crypto";
+import { BLOB_OVERHEAD, DecryptError, decryptBlob, encryptBlob } from "./crypto";
 import type { IndexDb, IndexSnapshot } from "./db";
 import { SerialQueue, TelegramError, type TelegramClient, type TgChatFullInfo, type TgMessage } from "./telegram";
 
@@ -6,6 +6,12 @@ export const SNAPSHOT_CAPTION = "tgstore-index-snapshot v1";
 export const SNAPSHOT_AAD = "tgstore-index-snapshot";
 const SNAPSHOT_FILENAME = "index-snapshot.bin";
 const SNAPSHOT_META = "snapshot_message_id";
+
+// v1 payloads predate blob ranges: each object owned a whole Telegram document.
+type LegacyIndexSnapshot = Omit<IndexSnapshot, "v" | "objects"> & {
+  v: 1;
+  objects: Omit<IndexSnapshot["objects"][number], "blobOffset" | "blobLength">[];
+};
 
 export interface SnapshotDeps {
   db: IndexDb;
@@ -65,17 +71,25 @@ export class Snapshot {
     }
 
     const enc = await tg.downloadFile(pinned.document.file_id);
-    let snap: IndexSnapshot;
+    let snap: IndexSnapshot | LegacyIndexSnapshot;
     try {
       const plain = await decryptBlob(key, SNAPSHOT_AAD, enc);
-      snap = JSON.parse(new TextDecoder().decode(Bun.gunzipSync(plain))) as IndexSnapshot;
+      snap = JSON.parse(new TextDecoder().decode(Bun.gunzipSync(plain))) as IndexSnapshot | LegacyIndexSnapshot;
     } catch (err) {
       if (err instanceof DecryptError) throw new Error("restore: snapshot decrypt failed (wrong MASTER_KEY?)");
       throw err;
     }
-    if (snap.v !== 1) throw new Error("restore: unsupported snapshot version");
+    if (snap.v !== 1 && snap.v !== 2) throw new Error("restore: unsupported snapshot version");
 
-    db.loadSnapshot(snap);
+    const indexed: IndexSnapshot =
+      snap.v === 1
+        ? {
+            ...snap,
+            v: 2,
+            objects: snap.objects.map((o) => ({ ...o, blobOffset: 0, blobLength: o.size + BLOB_OVERHEAD })),
+          }
+        : snap;
+    db.loadSnapshot(indexed);
     db.setMeta(SNAPSHOT_META, String(pinned.message_id));
     console.log(`restore: restored ${snap.buckets.length} buckets, ${snap.objects.length} objects from snapshot`);
     return "restored";
@@ -102,7 +116,7 @@ export class Snapshot {
       const payload = Bun.gzipSync(
         new TextEncoder().encode(
           JSON.stringify({
-            v: 1,
+            v: 2,
             createdAt: Date.now(),
             buckets: db.allBuckets(),
             objects: db.allObjects(),

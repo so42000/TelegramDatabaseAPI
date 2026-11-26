@@ -193,14 +193,18 @@ export class TelegramClient {
 export class SerialQueue {
   private tail: Promise<void> = Promise.resolve();
   private lastStart = -Infinity;
+  // Jobs submitted but not yet started.
+  private waiting = 0;
 
   constructor(private readonly minIntervalMs: number) {}
 
   run<T>(fn: () => Promise<T>): Promise<T> {
+    this.waiting++;
     const job = this.tail.then(async () => {
       const wait = this.lastStart + this.minIntervalMs - Date.now();
       if (wait > 0) await sleep(wait);
       this.lastStart = Date.now();
+      this.waiting--;
       return fn();
     });
     this.tail = job.then(
@@ -208,5 +212,10 @@ export class SerialQueue {
       () => undefined,
     );
     return job;
+  }
+
+  // When a job submitted now would start, ignoring how long a running job takes. Infinity while another job is still waiting.
+  nextStartAt(): number {
+    return this.waiting > 0 ? Infinity : this.lastStart + this.minIntervalMs;
   }
 }

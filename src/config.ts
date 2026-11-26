@@ -1,5 +1,5 @@
 export interface Config {
-  botToken: string;
+  botTokens: string[];
   channelId: string;
   ownerIds: Set<number>;
   masterKey: Uint8Array<ArrayBuffer>;
@@ -38,6 +38,20 @@ function intVar(env: Env, name: string, def: number, min: number, max = Number.M
   return n;
 }
 
+const BOT_TOKEN_RE = /^\d+:[A-Za-z0-9_-]+$/;
+
+// Comma-separated, one token per bot. A repeated token would be the same bot twice, so it is rejected.
+function parseBotTokens(env: Env): string[] {
+  const tokens = required(env, "TELEGRAM_BOT_TOKENS")
+    .split(",")
+    .map((s) => s.trim());
+  for (const token of tokens) {
+    if (!BOT_TOKEN_RE.test(token)) fail("TELEGRAM_BOT_TOKENS", "must be comma-separated bot tokens");
+  }
+  if (new Set(tokens).size !== tokens.length) fail("TELEGRAM_BOT_TOKENS", "must not contain the same token twice");
+  return tokens;
+}
+
 export function loadConfig(env: Env = process.env): Config {
   const ownerIds = new Set<number>();
   for (const part of required(env, "OWNER_IDS").split(",")) {
@@ -52,7 +66,7 @@ export function loadConfig(env: Env = process.env): Config {
   if (masterKey.byteLength !== 32) fail("MASTER_KEY", "must decode to exactly 32 bytes");
 
   return {
-    botToken: required(env, "TELEGRAM_BOT_TOKEN"),
+    botTokens: parseBotTokens(env),
     channelId: required(env, "STORAGE_CHANNEL_ID"),
     ownerIds,
     masterKey,

@@ -14,7 +14,7 @@ Your servers talk to an HTTP API with a per-bucket password. The owner manages b
 
 ## 1. Create the bot and channel
 
-1. In Telegram, message @BotFather, send `/newbot`, and copy the token. This is `TELEGRAM_BOT_TOKEN`.
+1. In Telegram, message @BotFather, send `/newbot`, and copy the token. This is `TELEGRAM_BOT_TOKENS`. For more write throughput, create more bots and add them to the storage channel as admins with Post, Edit and Delete rights; list all tokens comma-separated.
 2. Create a **private channel**. Add your bot as an administrator with **Post Messages**, **Edit Messages** and **Delete Messages** rights.
 3. Find the IDs:
    1. Post any message in the channel.
@@ -39,7 +39,7 @@ Keep this key safe and outside the container. Without it, the encrypted snapshot
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | yes | | Bot token from BotFather |
+| `TELEGRAM_BOT_TOKENS` | yes | | Comma-separated bot tokens from BotFather; each bot must be a channel admin and receive `/start` from the owner |
 | `STORAGE_CHANNEL_ID` | yes | | Private channel id, e.g. `-1001234567890` |
 | `OWNER_IDS` | yes | | Comma-separated Telegram user ids allowed to use the bot |
 | `MASTER_KEY` | yes | | Base64 of exactly 32 random bytes |

@@ -1,7 +1,8 @@
 import type { IndexDb, ObjectRow } from "./db";
 import { decryptBlob, encryptBlob, hashToken, newBucketToken, sha256Hex, tokenMatches } from "./crypto";
 import { NoSuchBucketError, type Batcher, type Dirtyable } from "./batcher";
-import type { TelegramClient } from "./telegram";
+import { isBotLost, laneName, type BotPool } from "./pool";
+import { TelegramError, type TgMessage } from "./telegram";
 
 // Stays below the 20 MB getFile cap even with the 29-byte encryption overhead.
 export const MAX_OBJECT_BYTES = 19 * 1024 * 1024;
@@ -56,14 +57,75 @@ function toMeta(row: ObjectRow): ObjectMeta {
 
 export interface StoreDeps {
   db: IndexDb;
-  tg: TelegramClient;
+  pool: BotPool;
   batcher: Batcher;
   key: CryptoKey;
   snapshot: Dirtyable;
+  channelId: string;
 }
 
 export class Store {
   constructor(private readonly deps: StoreDeps) {}
+
+  private readonly rebinding = new Map<number, Promise<void>>();
+
+  // Objects from before multi-bot support have bot_id 0. They were all stored by one bot: the first
+  // configured bot whose getFile accepts their file_id owns them. If none does, they stay unowned.
+  async claimUnownedObjects(): Promise<void> {
+    const { db, pool, snapshot } = this.deps;
+    const fileId = db.unownedFileId();
+    if (fileId === null) return;
+    for (const lane of pool.lanes) {
+      try {
+        await lane.tg.call("getFile", { file_id: fileId });
+      } catch (err) {
+        if (err instanceof TelegramError && err.code === 400) continue;
+        throw err;
+      }
+      const n = db.claimUnowned(lane.botId);
+      snapshot.markDirty();
+      console.log(`claim: ${n} objects stored before multi-bot support belong to ${laneName(lane)}`);
+      return;
+    }
+    console.log("claim: no configured bot owns the objects stored before multi-bot support; they move to a configured bot on first read");
+  }
+
+  // Concurrent reads of one message share one caption edit.
+  private rebind(messageId: number): Promise<void> {
+    const running = this.rebinding.get(messageId);
+    if (running) return running;
+    const job = this.takeOver(messageId).finally(() => this.rebinding.delete(messageId));
+    this.rebinding.set(messageId, job);
+    return job;
+  }
+
+  // File ids work only for the bot that received them. Editing a batch message's caption (allowed for any
+  // channel admin with Edit rights) returns the message with a file_id for the editing bot, which then owns
+  // every object in it. Captions are random UUIDs, so the edit reveals nothing.
+  private async takeOver(messageId: number): Promise<void> {
+    const { db, pool, channelId, snapshot } = this.deps;
+    for (;;) {
+      const lane = pool.pickWriter();
+      let msg: TgMessage;
+      try {
+        msg = await lane.queue.run(() =>
+          lane.tg.call<TgMessage>("editMessageCaption", {
+            chat_id: channelId,
+            message_id: messageId,
+            caption: crypto.randomUUID(),
+          }),
+        );
+      } catch (err) {
+        if (isBotLost(err) && pool.disable(lane, err)) continue;
+        throw err;
+      }
+      if (!msg.document) throw new Error(`message ${messageId} has no document`);
+      const moved = db.rebindMessage(messageId, lane.botId, msg.document.file_id);
+      snapshot.markDirty();
+      console.log(`rebind: message ${messageId} (${moved} objects) now read by ${laneName(lane)}`);
+      return;
+    }
+  }
 
   authorize(bucket: string, token: string): boolean {
     const b = this.deps.db.getBucket(bucket);
@@ -97,12 +159,29 @@ export class Store {
   }
 
   async get(bucket: string, key: string): Promise<{ meta: ObjectMeta; body: Uint8Array<ArrayBuffer> } | null> {
-    const row = this.deps.db.getObject(bucket, key);
-    if (!row) return null;
-    const enc = await this.deps.tg.downloadFile(row.fileId, { offset: row.blobOffset, length: row.blobLength });
-    const body = await decryptBlob(this.deps.key, row.objectId, enc);
-    if (sha256Hex(body) !== row.sha256) throw new IntegrityError("sha256 mismatch");
-    return { meta: toMeta(row), body };
+    for (let attempt = 0; ; attempt++) {
+      const row = this.deps.db.getObject(bucket, key);
+      if (!row) return null;
+      const lane = this.deps.pool.byBotId(row.botId);
+      if (!lane) {
+        if (attempt > 0) throw new Error(`no configured bot can read message ${row.messageId}`);
+        await this.rebind(row.messageId);
+        continue;
+      }
+      let enc: Uint8Array<ArrayBuffer>;
+      try {
+        enc = await lane.tg.downloadFile(row.fileId, { offset: row.blobOffset, length: row.blobLength });
+      } catch (err) {
+        if (attempt === 0 && isBotLost(err) && this.deps.pool.disable(lane, err)) {
+          await this.rebind(row.messageId);
+          continue;
+        }
+        throw err;
+      }
+      const body = await decryptBlob(this.deps.key, row.objectId, enc);
+      if (sha256Hex(body) !== row.sha256) throw new IntegrityError("sha256 mismatch");
+      return { meta: toMeta(row), body };
+    }
   }
 
   // Concurrent PUT and DELETE on the same key have no guaranteed order.

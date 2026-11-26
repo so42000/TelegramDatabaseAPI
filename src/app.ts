@@ -6,7 +6,8 @@ import { importMasterKey } from "./crypto";
 import { openDb } from "./db";
 import { Snapshot } from "./snapshot";
 import { MAX_OBJECT_BYTES, Store } from "./store";
-import { SerialQueue, TelegramClient, type TgChatFullInfo, type TgChatMember, type TgUser } from "./telegram";
+import { BotPool, laneName } from "./pool";
+import type { TgChatFullInfo, TgChatMember } from "./telegram";
 
 const REQUEST_OVERHEAD_BYTES = 1024 * 1024;
 
@@ -17,35 +18,40 @@ export interface App {
 
 // Startup checks run before any resource is opened, so a failed check leaves nothing behind.
 export async function createApp(config: Config): Promise<App> {
-  const tg = new TelegramClient({ apiBase: config.apiBase, token: config.botToken });
+  const pool = await BotPool.connect({
+    apiBase: config.apiBase,
+    tokens: config.botTokens,
+    minIntervalMs: config.channelMinIntervalMs,
+  });
 
-  const me = await tg.call<TgUser>("getMe");
-  if (config.botPolling) await tg.call("deleteWebhook", { drop_pending_updates: false });
-
-  const chat = await tg.call<TgChatFullInfo>("getChat", { chat_id: config.channelId });
+  const chat = await pool.primary().tg.call<TgChatFullInfo>("getChat", { chat_id: config.channelId });
   if (chat.type !== "channel") throw new Error("STORAGE_CHANNEL_ID must be a channel");
 
-  const member = await tg.call<TgChatMember>("getChatMember", { chat_id: config.channelId, user_id: me.id });
-  if (
-    member.status !== "administrator" ||
-    !member.can_post_messages ||
-    !member.can_edit_messages ||
-    !member.can_delete_messages
-  ) {
-    throw new Error("bot must be a channel admin with Post, Edit and Delete messages rights");
-  }
+  await Promise.all(
+    pool.lanes.map(async (lane) => {
+      try {
+        if (config.botPolling) await lane.tg.call("deleteWebhook", { drop_pending_updates: false });
+        const member = await lane.tg.call<TgChatMember>("getChatMember", {
+          chat_id: config.channelId,
+          user_id: lane.botId,
+        });
+        if (
+          member.status !== "administrator" ||
+          !member.can_post_messages ||
+          !member.can_edit_messages ||
+          !member.can_delete_messages
+        ) {
+          throw new Error("bot must be a channel admin with Post, Edit and Delete messages rights");
+        }
+      } catch (err) {
+        throw new Error(`${laneName(lane)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }),
+  );
 
   const key = await importMasterKey(config.masterKey);
   const db = openDb(config.dbPath);
-  const channelQueue = new SerialQueue(config.channelMinIntervalMs);
-  const snapshot = new Snapshot({
-    db,
-    tg,
-    channelQueue,
-    channelId: config.channelId,
-    key,
-    intervalMs: config.snapshotIntervalMs,
-  });
+  const snapshot = new Snapshot({ db, pool, channelId: config.channelId, key, intervalMs: config.snapshotIntervalMs });
 
   try {
     await snapshot.restoreIfEmpty();
@@ -58,26 +64,28 @@ export async function createApp(config: Config): Promise<App> {
   try {
     const batcher = new Batcher({
       db,
-      tg,
-      channelQueue,
+      pool,
       channelId: config.channelId,
       snapshot,
       maxPendingBytes: config.queueMaxBytes,
     });
-    const store = new Store({ db, tg, batcher, key, snapshot });
+    const store = new Store({ db, pool, batcher, key, snapshot, channelId: config.channelId });
+    await store.claimUnownedObjects();
     const server = Bun.serve({
       port: config.port,
       fetch: createApiHandler(store),
       maxRequestBodySize: MAX_OBJECT_BYTES + REQUEST_OVERHEAD_BYTES,
     });
-    const bot = new Bot({ tg, store, snapshot, ownerIds: config.ownerIds });
-    if (config.botPolling) bot.start();
+    const bots = pool.lanes.map(
+      (lane) => new Bot({ tg: lane.tg, name: laneName(lane), store, snapshot, ownerIds: config.ownerIds }),
+    );
+    if (config.botPolling) for (const bot of bots) bot.start();
 
     if (server.port === undefined) throw new Error("server has no TCP port");
     return {
       port: server.port,
       stop: async () => {
-        await bot.stop();
+        await Promise.all(bots.map((bot) => bot.stop()));
         server.stop(true);
         await snapshot.stop();
         db.close();

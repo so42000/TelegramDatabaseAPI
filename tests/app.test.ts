@@ -7,7 +7,7 @@ import type { Config } from "../src/config";
 import { MAX_OBJECT_BYTES } from "../src/store";
 import { encryptBlob, hashToken, importMasterKey, newBucketToken, sha256Hex } from "../src/crypto";
 import { SNAPSHOT_AAD, SNAPSHOT_CAPTION } from "../src/snapshot";
-import { FAKE_CHANNEL_ID, startFakeTelegram, type FakeTelegram } from "./fake-telegram";
+import { FAKE_BOT_ID, FAKE_CHANNEL_ID, startFakeTelegram, type FakeTelegram } from "./fake-telegram";
 
 const TOKEN_RE = /tgs_[A-Za-z0-9_-]{43}/;
 const OWNER_ID = 42;
@@ -26,11 +26,15 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+function botTokens(n: number): string[] {
+  return Array.from({ length: n }, (_, i) => `${FAKE_BOT_ID + i}:test-token`);
+}
+
 function makeConfig(over: Partial<Config> = {}): Config {
   const dir = mkdtempSync(join(tmpdir(), "tgstore-"));
   dirs.push(dir);
   return {
-    botToken: "123456:test-token",
+    botTokens: botTokens(1),
     channelId: FAKE_CHANNEL_ID,
     ownerIds: new Set([OWNER_ID]),
     masterKey: crypto.getRandomValues(new Uint8Array(32)),
@@ -100,6 +104,10 @@ function putObject(app: App, bucket: string, key: string, token: string, body: B
 
 function sendDocumentCount(): number {
   return fake.state.calls.filter((c) => c === "sendDocument").length;
+}
+
+function sendDocumentBots(from: number): number[] {
+  return fake.state.botCalls.slice(from).filter((c) => c.method === "sendDocument").map((c) => c.botId);
 }
 
 describe("tg storage app", () => {
@@ -337,5 +345,91 @@ describe("tg storage app", () => {
     expect(get.status).toBe(200);
     expect(get.headers.get("content-type")).toBe("text/plain");
     expect(await get.text()).toBe("legacy");
+  });
+
+  test("with 10 bots, back-to-back writes go to idle bots instead of waiting for one bot's slot", async () => {
+    const app = await launch(makeConfig({ botTokens: botTokens(10), channelMinIntervalMs: 2000 }));
+    const token = await createBucketViaBot("myapp");
+
+    const from = fake.state.botCalls.length;
+    const t0 = performance.now();
+    const statuses: number[] = [];
+    for (let i = 0; i < 3; i++) statuses.push((await putObject(app, "myapp", `k${i}`, token, `v${i}`)).status);
+    const elapsed = performance.now() - t0;
+
+    expect(statuses).toEqual([201, 201, 201]);
+    expect(sendDocumentBots(from)).toEqual([FAKE_BOT_ID + 1, FAKE_BOT_ID + 2, FAKE_BOT_ID + 3]);
+    expect(elapsed).toBeLessThan(1500);
+    for (let i = 0; i < 3; i++) {
+      const get = await fetch(objectUrl(app, "myapp", `k${i}`), { headers: { Authorization: `Bearer ${token}` } });
+      expect(await get.text()).toBe(`v${i}`);
+    }
+  }, 15_000);
+
+  test("the owner can store a file through bot #3 and fetch it through bot #1", async () => {
+    const app = await launch(makeConfig({ botTokens: botTokens(3) }));
+    await createBucketViaBot("myapp");
+    fake.state.files.set("doc-3", new TextEncoder().encode("from bot 3"));
+    fake.state.fileOwners.set("doc-3", FAKE_BOT_ID + 2);
+
+    const from = fake.state.botCalls.length;
+    const sentBefore = fake.state.sent.length;
+    await fake.state.sendUpdate(
+      ownerMessage({
+        caption: "myapp notes/a",
+        document: { file_id: "doc-3", file_unique_id: "doc-3", file_size: 10, mime_type: "text/plain" },
+      }),
+      FAKE_BOT_ID + 2,
+    );
+    expect(fake.state.sent.slice(sentBefore)[0]?.text.startsWith("Stored")).toBe(true);
+    expect(sendDocumentBots(from)).toEqual([FAKE_BOT_ID + 1]);
+
+    await fake.state.sendUpdate(ownerMessage({ text: "/get myapp notes/a" }));
+    const reply = [...fake.state.messages.values()].filter((m) => m.chat.id === OWNER_ID).at(-1);
+    const bytes = reply?.document ? fake.state.files.get(reply.document.file_id) : undefined;
+    if (!bytes) throw new Error("no document reply for /get");
+    expect(new TextDecoder().decode(bytes)).toBe("from bot 3");
+    await app.stop();
+  });
+
+  test("objects stored by a bot removed from the config are taken over on first read", async () => {
+    const masterKey = crypto.getRandomValues(new Uint8Array(32));
+    const tokens = botTokens(3);
+    const cfg = makeConfig({ masterKey, botTokens: tokens });
+    const app = await launch(cfg);
+    const token = await createBucketViaBot("myapp");
+    const from = fake.state.botCalls.length;
+    expect((await putObject(app, "myapp", "k", token, "kept")).status).toBe(201);
+    expect(sendDocumentBots(from)).toEqual([FAKE_BOT_ID + 1]);
+    await app.stop();
+
+    const relaunched = await launch(
+      makeConfig({ masterKey, dbPath: cfg.dbPath, botTokens: tokens.filter((_, i) => i !== 1) }),
+    );
+    for (let i = 0; i < 2; i++) {
+      const get = await fetch(objectUrl(relaunched, "myapp", "k"), { headers: { Authorization: `Bearer ${token}` } });
+      expect(get.status).toBe(200);
+      expect(await get.text()).toBe("kept");
+    }
+    expect(fake.state.botCalls.filter((c) => c.method === "editMessageCaption")).toHaveLength(1);
+  });
+
+  test("a bot that loses access mid-run is dropped; its writes and reads move to the remaining bots", async () => {
+    const app = await launch(makeConfig({ botTokens: botTokens(3) }));
+    const token = await createBucketViaBot("myapp");
+    expect((await putObject(app, "myapp", "a", token, "a")).status).toBe(201);
+
+    fake.state.lostBots.add(FAKE_BOT_ID + 2);
+    const from = fake.state.botCalls.length;
+    expect((await putObject(app, "myapp", "b", token, "b")).status).toBe(201);
+    expect(sendDocumentBots(from)).toEqual([FAKE_BOT_ID + 2, FAKE_BOT_ID]);
+
+    fake.state.lostBots.add(FAKE_BOT_ID + 1);
+    for (const key of ["a", "b"]) {
+      const get = await fetch(objectUrl(app, "myapp", key), { headers: { Authorization: `Bearer ${token}` } });
+      expect(get.status).toBe(200);
+      expect(await get.text()).toBe(key);
+    }
+    expect(fake.state.botCalls).toContainEqual({ botId: FAKE_BOT_ID, method: "editMessageCaption" });
   });
 });

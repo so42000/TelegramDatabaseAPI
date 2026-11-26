@@ -1,5 +1,6 @@
 import type { CommitResult, IndexDb, ObjectRow } from "./db";
-import type { SerialQueue, TelegramClient, TgMessage } from "./telegram";
+import type { TgMessage } from "./telegram";
+import { isBotLost, type BotLane, type BotPool } from "./pool";
 
 // Below the 20 MB getFile cap (19,923,968 bytes once the cap is applied to a whole batch).
 export const MAX_BATCH_BYTES = 19 * 1024 * 1024 + 1024;
@@ -15,12 +16,11 @@ export interface Dirtyable {
   markDirty(): void;
 }
 
-export type ObjectDraft = Omit<ObjectRow, "messageId" | "fileId" | "blobOffset" | "blobLength" | "updatedAt">;
+export type ObjectDraft = Omit<ObjectRow, "messageId" | "fileId" | "blobOffset" | "blobLength" | "updatedAt" | "botId">;
 
 export interface BatcherDeps {
   db: IndexDb;
-  tg: TelegramClient;
-  channelQueue: SerialQueue;
+  pool: BotPool;
   channelId: string;
   snapshot: Dirtyable;
   maxPendingBytes: number;
@@ -33,12 +33,12 @@ interface PendingItem {
   reject: (err: unknown) => void;
 }
 
-// Group commit: PUTs that arrive while a channel slot is pending are stored in one Telegram
-// document. SerialQueue spaces slots CHANNEL_MIN_INTERVAL_MS apart, which is the collection window.
+// Group commit: a PUT goes out at once on the bot whose slot is free first. PUTs that arrive while every
+// bot's slot is busy wait in `pending` and go out as one document. Each bot's SerialQueue spaces its own writes.
 export class Batcher {
   private pending: PendingItem[] = [];
   private pendingBytes = 0;
-  // True while a send job sits in channelQueue and has not started yet.
+  // True while a send job sits in a bot's queue and has not started yet.
   private scheduled = false;
 
   constructor(private readonly deps: BatcherDeps) {}
@@ -56,14 +56,19 @@ export class Batcher {
 
   private schedule(): void {
     if (this.scheduled || this.pending.length === 0) return;
+    const lane = this.deps.pool.pickWriter();
     this.scheduled = true;
-    void this.deps.channelQueue.run(() => this.sendNext());
+    void lane.queue.run(() => this.sendNext(lane));
   }
 
-  // Runs inside a channelQueue job, so it calls tg directly: going through the queue again would deadlock.
+  // Runs inside a lane.queue job, so it calls lane.tg directly: going through the queue again would deadlock.
   // Never throws; every failure is delivered to the taken items' reject.
-  private async sendNext(): Promise<void> {
+  private async sendNext(lane: BotLane): Promise<void> {
     this.scheduled = false;
+    if (lane.disabled) {
+      this.schedule();
+      return;
+    }
     let count = 0;
     let takenBytes = 0;
     for (const next of this.pending) {
@@ -76,7 +81,7 @@ export class Batcher {
     if (taken.length === 0) return;
     this.schedule();
 
-    const { db, tg, channelId, snapshot } = this.deps;
+    const { db, channelId, snapshot } = this.deps;
     const offsets: number[] = [];
     let offset = 0;
     for (const item of taken) {
@@ -93,8 +98,15 @@ export class Batcher {
 
     let msg: TgMessage;
     try {
-      msg = await tg.callMultipart<TgMessage>("sendDocument", form);
+      msg = await lane.tg.callMultipart<TgMessage>("sendDocument", form);
     } catch (err) {
+      // concat, not unshift(...): a batch can hold hundreds of thousands of items
+      if (isBotLost(err) && this.deps.pool.disable(lane, err)) {
+        this.pending = taken.concat(this.pending);
+        this.pendingBytes += takenBytes;
+        this.schedule();
+        return;
+      }
       for (const item of taken) item.reject(err);
       return;
     }
@@ -110,6 +122,7 @@ export class Batcher {
       ...item.draft,
       messageId: msg.message_id,
       fileId: document.file_id,
+      botId: lane.botId,
       blobOffset: offsets[i] ?? 0,
       blobLength: item.enc.byteLength,
       updatedAt: now,
@@ -120,7 +133,7 @@ export class Batcher {
       results = db.commitBatch(msg.message_id, rows);
     } catch (err) {
       try {
-        await tg.call("deleteMessage", { chat_id: channelId, message_id: msg.message_id });
+        await lane.tg.call("deleteMessage", { chat_id: channelId, message_id: msg.message_id });
       } catch (delErr) {
         console.error(`orphan message ${msg.message_id} kept: ${String(delErr)}`);
       }

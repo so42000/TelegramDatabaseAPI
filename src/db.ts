@@ -9,6 +9,8 @@ export interface ObjectRow {
   objectId: string;
   messageId: number;
   fileId: string;
+  // Bot whose file_id this is. 0 = not claimed yet (rows written before multi-bot).
+  botId: number;
   contentType: string;
   size: number;
   sha256: string;
@@ -25,7 +27,7 @@ export interface BucketRow {
 }
 
 export interface IndexSnapshot {
-  v: 2;
+  v: 3;
   createdAt: number;
   buckets: BucketRow[];
   objects: ObjectRow[];
@@ -39,7 +41,7 @@ CREATE TABLE IF NOT EXISTS objects (
   bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
   key TEXT NOT NULL, object_id TEXT NOT NULL, message_id INTEGER NOT NULL, file_id TEXT NOT NULL,
   content_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, updated_at INTEGER NOT NULL,
-  blob_offset INTEGER NOT NULL DEFAULT 0, blob_length INTEGER NOT NULL,
+  blob_offset INTEGER NOT NULL DEFAULT 0, blob_length INTEGER NOT NULL, bot_id INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (bucket, key));
 CREATE TABLE IF NOT EXISTS pending_deletes (message_id INTEGER PRIMARY KEY, queued_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -47,7 +49,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 
 const OBJECT_COLS = `bucket, key, object_id AS objectId, message_id AS messageId, file_id AS fileId,
   content_type AS contentType, size, sha256, updated_at AS updatedAt,
-  blob_offset AS blobOffset, blob_length AS blobLength`;
+  blob_offset AS blobOffset, blob_length AS blobLength, bot_id AS botId`;
 
 const BUCKET_COLS = `name, token_hash AS tokenHash, created_at AS createdAt`;
 
@@ -109,6 +111,27 @@ export class IndexDb {
       .get(bucket, key) as ObjectRow | null;
   }
 
+  // A file_id from a row no bot has claimed yet, or null.
+  unownedFileId(): string | null {
+    const row = this.db
+      .query("SELECT file_id AS fileId FROM objects WHERE bot_id = 0 LIMIT 1")
+      .get() as { fileId: string } | null;
+    return row?.fileId ?? null;
+  }
+
+  // Only one bot existed before multi-bot, so every unclaimed row is owned by the bot that proved it can read them.
+  // Assigns every unclaimed object to botId; returns rows changed.
+  claimUnowned(botId: number): number {
+    return this.db.query("UPDATE objects SET bot_id = ? WHERE bot_id = 0").run(botId).changes;
+  }
+
+  // Points every object stored in messageId at fileId, a file id that belongs to botId. Returns rows changed.
+  rebindMessage(messageId: number, botId: number, fileId: string): number {
+    return this.db
+      .query("UPDATE objects SET file_id = ?, bot_id = ? WHERE message_id = ?")
+      .run(fileId, botId, messageId).changes;
+  }
+
   // Applies rows stored in one Telegram message, in order; later rows win over earlier ones
   // with the same key. Results match `rows` by index. Messages that no longer have any
   // referencing object are queued for deletion.
@@ -125,8 +148,8 @@ export class IndexDb {
         this.db
           .query(
             `INSERT OR REPLACE INTO objects (bucket, key, object_id, message_id, file_id, content_type, size, sha256,
-               updated_at, blob_offset, blob_length)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               updated_at, blob_offset, blob_length, bot_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             row.bucket,
@@ -140,6 +163,7 @@ export class IndexDb {
             row.updatedAt,
             row.blobOffset,
             row.blobLength,
+            row.botId,
           );
         if (prev) touched.add(prev.messageId);
         results.push(prev ? "replaced" : "created");
@@ -210,8 +234,8 @@ export class IndexDb {
       for (const b of s.buckets) insBucket.run(b.name, b.tokenHash, b.createdAt);
       const insObject = this.db.query(
         `INSERT INTO objects (bucket, key, object_id, message_id, file_id, content_type, size, sha256, updated_at,
-           blob_offset, blob_length)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           blob_offset, blob_length, bot_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const o of s.objects) {
         insObject.run(
@@ -226,6 +250,7 @@ export class IndexDb {
           o.updatedAt,
           o.blobOffset,
           o.blobLength,
+          o.botId,
         );
       }
     })();
@@ -246,8 +271,8 @@ export class IndexDb {
   }
 }
 
-// Adds blob columns to a pre-batching `objects` table. Legacy objects each own a whole
-// single-object document, so offset is 0 and length is the encrypted size.
+// Adds columns missing from an older `objects` table. Legacy rows each own a whole single-object
+// document, so offset is 0 and length is the encrypted size; their bot_id stays 0 until claimed.
 function migrate(db: Database): void {
   const cols = db.query("PRAGMA table_info(objects)").all() as { name: string }[];
   if (!cols.some((c) => c.name === "blob_offset")) {
@@ -258,6 +283,9 @@ function migrate(db: Database): void {
          UPDATE objects SET blob_length = size + ${BLOB_OVERHEAD};`,
       );
     })();
+  }
+  if (!cols.some((c) => c.name === "bot_id")) {
+    db.exec("ALTER TABLE objects ADD COLUMN bot_id INTEGER NOT NULL DEFAULT 0");
   }
   db.exec("CREATE INDEX IF NOT EXISTS objects_message_id ON objects(message_id)");
 }

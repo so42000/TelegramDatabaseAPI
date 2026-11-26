@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db";
 
 describe("legacy objects table migration", () => {
-  test("adds blob ranges (offset 0, length size + 29); reopening is a no-op", () => {
+  test("adds blob ranges (offset 0, length size + 29) and bot_id 0; reopening is a no-op", () => {
     const dir = mkdtempSync(join(tmpdir(), "tgstore-db-"));
     const path = join(dir, "index.sqlite");
     try {
@@ -27,6 +27,7 @@ INSERT INTO objects VALUES ('b', 'k', 'oid', 7, 'fid', 'text/plain', 10, 'sha', 
       const row = db.getObject("b", "k");
       expect(row?.blobOffset).toBe(0);
       expect(row?.blobLength).toBe(39);
+      expect(row?.botId).toBe(0);
       db.close();
 
       const again = openDb(path);

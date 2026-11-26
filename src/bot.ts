@@ -8,6 +8,7 @@ import {
 import { NoSuchBucketError } from "./batcher";
 import type { Snapshot } from "./snapshot";
 import type { TelegramClient, TgMessage, TgUpdate } from "./telegram";
+import { isBotLost } from "./pool";
 
 const MIB = 1024 * 1024;
 const LS_PAGE = 50;
@@ -29,6 +30,7 @@ const HELP = [
 ].join("\n");
 
 export interface BotDeps {
+  name: string;
   tg: TelegramClient;
   store: Store;
   snapshot: Snapshot;
@@ -111,7 +113,11 @@ export class Bot {
         }
       } catch (err) {
         if (signal.aborted) return;
-        console.error(`getUpdates failed, retrying: ${messageOf(err)}`);
+        if (isBotLost(err)) {
+          console.error(`${this.deps.name}: stopped polling: ${messageOf(err)}`);
+          return;
+        }
+        console.error(`${this.deps.name}: getUpdates failed, retrying: ${messageOf(err)}`);
         await sleep(RETRY_DELAY_MS, signal);
       }
     }

@@ -1,7 +1,7 @@
 import { loadConfig } from "../config";
 import { decryptBlob, importMasterKey, sha256Hex } from "../crypto";
 import { openDb, type ObjectRow } from "../db";
-import { TelegramClient } from "../telegram";
+import { BotPool } from "../pool";
 
 const out = process.argv[2];
 if (!out) {
@@ -12,7 +12,7 @@ if (!out) {
 // Read-only against Telegram and the index DB, so it is safe to run alongside the live service (WAL mode).
 const config = loadConfig();
 const db = openDb(config.dbPath);
-const tg = new TelegramClient({ apiBase: config.apiBase, token: config.botToken });
+const pool = await BotPool.connect({ apiBase: config.apiBase, tokens: config.botTokens, minIntervalMs: 0 });
 const key = await importMasterKey(config.masterKey);
 const writer = Bun.file(out).writer();
 
@@ -20,20 +20,30 @@ function errorLine(row: ObjectRow, err: unknown): string {
   return JSON.stringify({ bucket: row.bucket, key: row.key, error: err instanceof Error ? err.message : String(err) }) + "\n";
 }
 
-// Several objects can share one Telegram document, so rows are grouped by file and each file is downloaded once.
+// Several objects can share one Telegram document, so rows are grouped by owning bot and file id (file ids are
+// per bot) and each file is downloaded once.
 const byFile = new Map<string, ObjectRow[]>();
 for (const row of db.allObjects()) {
-  const group = byFile.get(row.fileId);
+  const groupKey = `${row.botId}:${row.fileId}`;
+  const group = byFile.get(groupKey);
   if (group) group.push(row);
-  else byFile.set(row.fileId, [row]);
+  else byFile.set(groupKey, [row]);
 }
 
 let ok = 0;
 let errors = 0;
-for (const [fileId, rows] of byFile) {
+for (const rows of byFile.values()) {
+  const [first] = rows;
+  if (!first) continue;
   let file: Uint8Array<ArrayBuffer>;
   try {
-    file = await tg.downloadFile(fileId);
+    const lane = pool.byBotId(first.botId);
+    if (!lane) {
+      throw new Error(
+        `stored by bot ${first.botId}, which is not in TELEGRAM_BOT_TOKENS; start the service and GET it once to move it to a configured bot`,
+      );
+    }
+    file = await lane.tg.downloadFile(first.fileId);
   } catch (err) {
     for (const row of rows) {
       errors++;

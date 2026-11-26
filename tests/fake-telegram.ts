@@ -1,8 +1,9 @@
 // In-memory stand-in for the Telegram Bot API. Implements only the methods the app calls,
 // with the same envelope, multipart and attach:// conventions as the real API.
+// Each bot has its own token, inbox and file_ids, as on real Telegram.
 
 export const FAKE_CHANNEL_ID = "-1001234567890";
-export const FAKE_BOT_ID = 999;
+export const FAKE_BOT_ID = 123456;
 const CHANNEL_ID = Number(FAKE_CHANNEL_ID);
 
 type Params = Record<string, unknown>;
@@ -33,12 +34,17 @@ export interface FakeState {
   files: Map<string, Uint8Array<ArrayBuffer>>;
   pinned: number | null;
   calls: string[];
+  botCalls: { botId: number; method: string }[];
   deleted: number[];
   sent: SentMessage[];
   fail429: Set<string>;
-  // Queues an incoming message. The promise resolves once the bot has finished handling it,
+  // file_id -> bot that can use it. Files with no entry are fixtures every bot can read.
+  fileOwners: Map<string, number>;
+  // Bots whose token is revoked: every call and file download returns 401.
+  lostBots: Set<number>;
+  // Queues an incoming message for one bot. The promise resolves once that bot has finished handling it,
   // which is observable because the bot only calls getUpdates again after its batch is handled.
-  sendUpdate: (message: Record<string, unknown>) => Promise<void>;
+  sendUpdate: (message: Record<string, unknown>, botId?: number) => Promise<void>;
 }
 
 export interface FakeTelegram {
@@ -54,6 +60,23 @@ class ApiError extends Error {
   ) {
     super(message);
   }
+}
+
+interface Update {
+  update_id: number;
+  message: Record<string, unknown>;
+}
+
+// Incoming updates waiting for one bot's getUpdates, the resolvers of the batch that bot is handling,
+// and long-poll waiters parked until an update arrives.
+interface Inbox {
+  queued: { update: Update; done: () => void }[];
+  handling: (() => void)[];
+  wakers: (() => void)[];
+}
+
+function botIdOf(token: string): number {
+  return Number(token.split(":")[0]);
 }
 
 function json(body: unknown, status = 200): Response {
@@ -75,27 +98,35 @@ export function startFakeTelegram(): FakeTelegram {
   const nextSeq = () => seq++;
   const now = () => Math.floor(Date.now() / 1000);
 
-  // Incoming updates waiting for getUpdates, the resolvers of the batch the bot is handling,
-  // and long-poll waiters parked until an update arrives.
-  const queued: { update: { update_id: number; message: Record<string, unknown> }; done: () => void }[] = [];
-  let handling: (() => void)[] = [];
-  const wakers: (() => void)[] = [];
+  const inboxes = new Map<number, Inbox>();
+  const inboxOf = (botId: number): Inbox => {
+    let box = inboxes.get(botId);
+    if (!box) {
+      box = { queued: [], handling: [], wakers: [] };
+      inboxes.set(botId, box);
+    }
+    return box;
+  };
 
   const state: FakeState = {
     messages: new Map(),
     files: new Map(),
     pinned: null,
     calls: [],
+    botCalls: [],
     deleted: [],
     sent: [],
     fail429: new Set(),
-    sendUpdate: (message) => {
+    fileOwners: new Map(),
+    lostBots: new Set(),
+    sendUpdate: (message, botId = FAKE_BOT_ID) => {
+      const box = inboxOf(botId);
       const { promise, resolve } = Promise.withResolvers<void>();
-      queued.push({
+      box.queued.push({
         update: { update_id: nextSeq(), message: { message_id: nextSeq(), date: now(), ...message } },
         done: resolve,
       });
-      for (const wake of wakers.splice(0)) wake();
+      for (const wake of box.wakers.splice(0)) wake();
       return promise;
     },
   };
@@ -105,10 +136,29 @@ export function startFakeTelegram(): FakeTelegram {
     type: Number(chatId) === CHANNEL_ID ? "channel" : "private",
   });
 
-  async function storeFile(blob: Blob): Promise<FakeDocument> {
+  // Each bot's file_id for the same bytes is a different string, as on real Telegram.
+  function fileIdFor(from: string, botId: number): string {
+    const bytes = state.files.get(from);
+    if (!bytes) throw new ApiError(400, "Bad Request: wrong file_id or the file is temporarily unavailable");
+    const fileId = `file-${nextSeq()}`;
+    state.files.set(fileId, bytes);
+    state.fileOwners.set(fileId, botId);
+    return fileId;
+  }
+
+  // What getChat shows a bot: the pinned message with a file_id that bot can use.
+  function viewFor(message: FakeMessage | undefined, botId: number): FakeMessage | undefined {
+    if (!message?.document) return message;
+    const owner = state.fileOwners.get(message.document.file_id);
+    if (owner === undefined || owner === botId) return message;
+    return { ...message, document: { ...message.document, file_id: fileIdFor(message.document.file_id, botId) } };
+  }
+
+  async function storeFile(blob: Blob, botId: number): Promise<FakeDocument> {
     const fileId = `file-${nextSeq()}`;
     const bytes = new Uint8Array(await blob.arrayBuffer());
     state.files.set(fileId, bytes);
+    state.fileOwners.set(fileId, botId);
     return {
       file_id: fileId,
       file_unique_id: fileId,
@@ -118,29 +168,34 @@ export function startFakeTelegram(): FakeTelegram {
     };
   }
 
-  async function addDocument(chatId: string, blob: Blob, caption: string | undefined): Promise<FakeMessage> {
+  async function addDocument(
+    chatId: string,
+    blob: Blob,
+    caption: string | undefined,
+    botId: number,
+  ): Promise<FakeMessage> {
     const message: FakeMessage = {
       message_id: nextSeq(),
       date: now(),
       chat: chatRef(chatId),
       caption,
-      document: await storeFile(blob),
+      document: await storeFile(blob, botId),
     };
     state.messages.set(message.message_id, message);
     return message;
   }
 
-  async function dispatch(method: string, p: Params): Promise<unknown> {
+  async function dispatch(method: string, p: Params, botId: number): Promise<unknown> {
     switch (method) {
       case "getMe":
-        return { id: FAKE_BOT_ID, is_bot: true, first_name: "tgstore-test", username: "tgstore_test_bot" };
+        return { id: botId, is_bot: true, first_name: "tgstore-test", username: `tgstore_test_${botId}_bot` };
       case "deleteWebhook":
         return true;
       case "getChat":
         return {
           id: CHANNEL_ID,
           type: "channel",
-          pinned_message: state.pinned === null ? undefined : state.messages.get(state.pinned),
+          pinned_message: viewFor(state.pinned === null ? undefined : state.messages.get(state.pinned), botId),
         };
       case "getChatMember":
         return { status: "administrator", can_post_messages: true, can_edit_messages: true, can_delete_messages: true };
@@ -149,6 +204,7 @@ export function startFakeTelegram(): FakeTelegram {
           String(p.chat_id),
           p.document as Blob,
           typeof p.caption === "string" ? p.caption : undefined,
+          botId,
         );
       case "editMessageMedia": {
         const message = state.messages.get(Number(p.message_id));
@@ -156,9 +212,20 @@ export function startFakeTelegram(): FakeTelegram {
         const media = JSON.parse(String(p.media)) as { media: string; caption?: string };
         const blob = p[media.media.replace(/^attach:\/\//, "")];
         if (!(blob instanceof Blob)) throw new ApiError(400, "Bad Request: media attachment missing");
-        message.document = await storeFile(blob);
+        message.document = await storeFile(blob, botId);
         message.caption = media.caption;
         return message;
+      }
+      case "editMessageCaption": {
+        const message = state.messages.get(Number(p.message_id));
+        if (!message) throw new ApiError(400, "Bad Request: message to edit not found");
+        const caption = String(p.caption);
+        if (caption === message.caption) throw new ApiError(400, "Bad Request: message is not modified");
+        message.caption = caption;
+        if (!message.document) return message;
+        // The stored message keeps its file_id; the editing bot gets its own.
+        const fileId = fileIdFor(message.document.file_id, botId);
+        return { ...message, document: { ...message.document, file_id: fileId } };
       }
       case "pinChatMessage": {
         const id = Number(p.message_id);
@@ -184,16 +251,20 @@ export function startFakeTelegram(): FakeTelegram {
       case "getFile": {
         const fileId = String(p.file_id);
         const bytes = state.files.get(fileId);
-        if (!bytes) throw new ApiError(400, "Bad Request: file not found");
+        const owner = state.fileOwners.get(fileId);
+        if (!bytes || (owner !== undefined && owner !== botId)) {
+          throw new ApiError(400, "Bad Request: wrong file_id or the file is temporarily unavailable");
+        }
         return { file_id: fileId, file_unique_id: fileId, file_size: bytes.byteLength, file_path: fileId };
       }
       case "getUpdates": {
+        const box = inboxOf(botId);
         // Previous batch is fully handled once the bot asks again.
-        for (const done of handling) done();
-        handling = [];
-        while (queued.length === 0) await new Promise<void>((wake) => wakers.push(wake));
-        const batch = queued.splice(0);
-        handling = batch.map((b) => b.done);
+        for (const done of box.handling) done();
+        box.handling = [];
+        while (box.queued.length === 0) await new Promise<void>((wake) => box.wakers.push(wake));
+        const batch = box.queued.splice(0);
+        box.handling = batch.map((b) => b.done);
         return batch.map((b) => b.update);
       }
       default:
@@ -203,9 +274,10 @@ export function startFakeTelegram(): FakeTelegram {
 
   async function handle(req: Request): Promise<Response> {
     const path = new URL(req.url).pathname;
-    const fileMatch = /^\/file\/bot[^/]+\/(.+)$/.exec(path);
+    const fileMatch = /^\/file\/bot([^/]+)\/(.+)$/.exec(path);
     if (fileMatch && req.method === "GET") {
-      const bytes = state.files.get(decodeURIComponent(fileMatch[1] ?? ""));
+      if (state.lostBots.has(botIdOf(fileMatch[1] ?? ""))) return new Response("unauthorized", { status: 401 });
+      const bytes = state.files.get(decodeURIComponent(fileMatch[2] ?? ""));
       if (!bytes) return new Response("not found", { status: 404 });
       const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.get("range") ?? "");
       if (!range) return new Response(bytes);
@@ -217,12 +289,17 @@ export function startFakeTelegram(): FakeTelegram {
       });
     }
 
-    const callMatch = /^\/bot[^/]+\/([A-Za-z]+)$/.exec(path);
+    const callMatch = /^\/bot([^/]+)\/([A-Za-z]+)$/.exec(path);
     if (!callMatch || req.method !== "POST") return new Response("not found", { status: 404 });
-    const method = callMatch[1] ?? "";
+    const botId = botIdOf(callMatch[1] ?? "");
+    const method = callMatch[2] ?? "";
     const params = await readParams(req);
     state.calls.push(method);
+    state.botCalls.push({ botId, method });
 
+    if (state.lostBots.has(botId)) {
+      return json({ ok: false, error_code: 401, description: "Unauthorized" }, 401);
+    }
     if (state.fail429.delete(method)) {
       return json(
         { ok: false, error_code: 429, description: "Too Many Requests: retry later", parameters: { retry_after: 1 } },
@@ -230,7 +307,7 @@ export function startFakeTelegram(): FakeTelegram {
       );
     }
     try {
-      return json({ ok: true, result: await dispatch(method, params) });
+      return json({ ok: true, result: await dispatch(method, params, botId) });
     } catch (err) {
       if (err instanceof ApiError) return json({ ok: false, error_code: err.code, description: err.message }, err.code);
       throw err;
